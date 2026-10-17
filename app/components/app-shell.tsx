@@ -4,7 +4,7 @@ import html2canvas from "html2canvas";
 import jsPDF from "jspdf";
 import Image from "next/image";
 import Link from "next/link";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import * as XLSX from "xlsx";
 
 import { Icon } from "./icons";
@@ -18,6 +18,11 @@ import {
   type WhatsAppMessageType,
 } from "@/lib/whatsapp";
 import { createClient } from "@/lib/supabase/client";
+import {
+  buildAcademicRevenueAnalytics,
+  type RevenuePayment,
+  type RevenueStudent,
+} from "@/lib/payment-analytics";
 
 export type Section =
   | "dashboard"
@@ -405,6 +410,13 @@ function Dashboard() {
   const [teacherShares, setTeacherShares] = useState(0);
   const [fixedTeacherSalaries, setFixedTeacherSalaries] = useState(0);
   const [levelCounts, setLevelCounts] = useState<Record<string, number>>({});
+  const [revenuePayments, setRevenuePayments] = useState<RevenuePayment[]>([]);
+  const [revenueStudents, setRevenueStudents] = useState<RevenueStudent[]>([]);
+  const [revenueAnalyticsLoading, setRevenueAnalyticsLoading] = useState(true);
+  const [revenueAnalyticsError, setRevenueAnalyticsError] = useState("");
+  const [selectedAcademicYearStartYear, setSelectedAcademicYearStartYear] = useState(
+    () => getSchoolYearStartYear()
+  );
   const [attendanceDate, setAttendanceDate] = useState(() => new Date().toISOString().slice(0, 10));
   const [attendanceStats, setAttendanceStats] = useState<Record<AttendanceStatus, number>>({ present: 0, absent: 0, late: 0, excused: 0 });
   const [loadingStats, setLoadingStats] = useState(true);
@@ -412,6 +424,8 @@ function Dashboard() {
   useEffect(() => {
     async function loadDashboardStats() {
       setLoadingStats(true);
+      setRevenueAnalyticsLoading(true);
+      setRevenueAnalyticsError("");
       const supabase = createClient();
 
       const now = new Date();
@@ -506,10 +520,139 @@ function Dashboard() {
     loadDashboardStats();
   }, [attendanceDate]);
 
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadAcademicRevenue() {
+      setRevenueAnalyticsLoading(true);
+      setRevenueAnalyticsError("");
+      const supabase = createClient();
+      const start = `${selectedAcademicYearStartYear}-09-01`;
+      const end = `${selectedAcademicYearStartYear + 1}-07-01`;
+
+      try {
+        async function loadPages<T>(
+          queryPage: (from: number, to: number) => PromiseLike<{
+            data: T[] | null;
+            error: { message: string } | null;
+          }>
+        ) {
+          const rows: T[] = [];
+          const pageSize = 1000;
+          for (let offset = 0; ; offset += pageSize) {
+            const { data, error } = await queryPage(offset, offset + pageSize - 1);
+            if (error) throw error;
+            const page = data ?? [];
+            rows.push(...page);
+            if (page.length < pageSize) return rows;
+          }
+        }
+
+        const [payments, students] = await Promise.all([
+          loadPages<{
+            id: string;
+            student_id: string;
+            payment_month: string;
+            amount_paid: number | string | null;
+          }>(async (from, to) =>
+            await supabase
+              .from("payments")
+              .select("id, student_id, payment_month, amount_paid")
+              .is("deleted_at", null)
+              .gte("payment_month", start)
+              .lt("payment_month", end)
+              .order("id", { ascending: true })
+              .range(from, to)
+          ),
+          loadPages<{
+            id: string;
+            level_code: string | null;
+          }>(async (from, to) =>
+            await supabase
+              .from("students")
+              .select("id, level_code")
+              .order("id", { ascending: true })
+              .range(from, to)
+          ),
+        ]);
+
+        if (cancelled) return;
+        setRevenuePayments(payments.map((payment) => ({
+          id: String(payment.id),
+          student_id: String(payment.student_id),
+          payment_month: String(payment.payment_month ?? ""),
+          amount_paid: Number(payment.amount_paid ?? 0),
+        })));
+        setRevenueStudents(students.map((student) => ({
+          id: String(student.id),
+          level_code: student.level_code == null ? null : String(student.level_code),
+        })));
+      } catch (error) {
+        console.error("Dashboard academic revenue query failed", error);
+        if (!cancelled) {
+          setRevenuePayments([]);
+          setRevenueStudents([]);
+          setRevenueAnalyticsError("تعذر تحميل الأداءات أو مستويات التلاميذ لتحليل المداخيل.");
+        }
+      } finally {
+        if (!cancelled) setRevenueAnalyticsLoading(false);
+      }
+    }
+
+    void loadAcademicRevenue();
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedAcademicYearStartYear]);
+
   const totalTeacherCosts = teacherShares + fixedTeacherSalaries;
   const profit = income - totalTeacherCosts - expenses;
   const formatMoney = (value: number) =>
     `${value.toLocaleString("fr-FR", { maximumFractionDigits: 2 })} د.م`;
+  const revenueAnalytics = useMemo(
+    () => buildAcademicRevenueAnalytics(
+      revenuePayments,
+      revenueStudents,
+      selectedAcademicYearStartYear
+    ),
+    [revenuePayments, revenueStudents, selectedAcademicYearStartYear]
+  );
+  const academicYearOptions = useMemo(
+    () => {
+      const lastYear = new Date().getFullYear() + 1;
+      const availableYears = Array.from(
+        { length: lastYear - 2000 + 1 },
+        (_, index) => lastYear - index
+      );
+      return availableYears.includes(selectedAcademicYearStartYear)
+        ? availableYears
+        : [selectedAcademicYearStartYear, ...availableYears];
+    },
+    [selectedAcademicYearStartYear]
+  );
+  const maximumMonthlyRevenue = Math.max(
+    0,
+    ...revenueAnalytics.months.map((month) => month.amount)
+  );
+  const maximumLevelRevenue = Math.max(
+    0,
+    ...revenueAnalytics.levelTotals.map((level) => level.amount)
+  );
+  const levelDisplayOrder = [
+    ...levels.map((level) => levelToCode[level]),
+    ...revenueAnalytics.levelCodes.filter(
+      (levelCode) => !levels.some((level) => levelToCode[level] === levelCode)
+    ),
+  ];
+  const revenueLevels = levelDisplayOrder
+    .filter((levelCode) => revenueAnalytics.levelCodes.includes(levelCode))
+    .map((levelCode) => ({
+      levelCode,
+      label: codeToLevel[levelCode] ?? levelCode,
+      amount: revenueAnalytics.levelTotals.find((level) => level.levelCode === levelCode)?.amount ?? 0,
+    }));
+  const formatRevenueAmount = (amount: number) =>
+    `${amount.toLocaleString("fr-FR", { maximumFractionDigits: 2 })} DH`;
 
   const stats = [
     ["users", loadingStats ? "..." : String(studentCount), "studentCount", "mint"],
@@ -575,6 +718,193 @@ function Dashboard() {
         </div>
       </section>
 
+      <section className="dashboard-finance" dir="rtl">
+        <div className="panel-head" style={{ alignItems: "center", flexWrap: "wrap", gap: 12 }}>
+          <div>
+            <h2>تحليل المداخيل حسب السنة الدراسية</h2>
+            <p>المبالغ المسجلة حسب الشهر الدراسي المؤدى عنه، من شتنبر إلى يونيو.</p>
+          </div>
+          <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            السنة الدراسية
+            <select
+              value={selectedAcademicYearStartYear}
+              onChange={(event) => setSelectedAcademicYearStartYear(Number(event.target.value))}
+              aria-label="اختر السنة الدراسية"
+            >
+              {academicYearOptions.map((startYear) => (
+                <option key={startYear} value={startYear}>
+                  {startYear}–{startYear + 1}
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
+
+        {revenueAnalyticsLoading ? (
+          <div className="empty" style={{ textAlign: "center" }}>
+            <h2>جاري تحميل تحليل المداخيل...</h2>
+          </div>
+        ) : revenueAnalyticsError ? (
+          <p className="form-error" role="alert">{revenueAnalyticsError}</p>
+        ) : (
+          <>
+            <div
+              aria-label="المداخيل الشهرية بالدرهم"
+              style={{
+                display: "grid",
+                gridTemplateColumns: "repeat(10, minmax(72px, 1fr))",
+                gap: 10,
+                alignItems: "end",
+                overflowX: "auto",
+                padding: "18px 8px 8px",
+              }}
+            >
+              {revenueAnalytics.months.map((month) => (
+                <div
+                  key={month.key}
+                  style={{
+                    minWidth: 72,
+                    display: "grid",
+                    gridTemplateRows: "auto 170px auto",
+                    gap: 8,
+                    alignItems: "end",
+                    textAlign: "center",
+                  }}
+                >
+                  <strong style={{ fontSize: 11 }}>
+                    {formatRevenueAmount(month.amount)}
+                  </strong>
+                  <div
+                    style={{
+                      height: 170,
+                      display: "flex",
+                      alignItems: "end",
+                      justifyContent: "center",
+                      borderBottom: "1px solid #dfe8e4",
+                      background: "repeating-linear-gradient(to top, transparent 0, transparent 41px, #edf2ef 42px)",
+                    }}
+                  >
+                    <div
+                      title={`${month.label} ${month.year}: ${formatRevenueAmount(month.amount)}`}
+                      style={{
+                        width: "58%",
+                        height: maximumMonthlyRevenue > 0
+                          ? `${Math.max((month.amount / maximumMonthlyRevenue) * 160, month.amount > 0 ? 4 : 0)}px`
+                          : 0,
+                        background: "#16806b",
+                        borderRadius: "6px 6px 0 0",
+                        transition: "height 180ms ease",
+                      }}
+                    />
+                  </div>
+                  <span style={{ fontSize: 12, fontWeight: 700 }}>{month.label}</span>
+                </div>
+              ))}
+            </div>
+
+            {revenueAnalytics.months.every((month) => month.paymentCount === 0) && (
+              <p className="empty" style={{ textAlign: "center", margin: "0 12px 14px" }}>
+                لا توجد أداءات مسجلة لهذه السنة الدراسية.
+              </p>
+            )}
+
+            <div style={{ marginTop: 18, borderTop: "1px solid #edf1ef", paddingTop: 18 }}>
+              <div style={{ marginBottom: 12 }}>
+                <h3 style={{ margin: "0 0 5px" }}>المداخيل حسب المستوى الدراسي</h3>
+                <p style={{ margin: 0, color: "#83908d", fontSize: 12 }}>
+                  المبالغ مبنية على الأداءات المسجلة للتلاميذ المرتبطين بكل مستوى.
+                </p>
+              </div>
+              {revenueLevels.length === 0 ? (
+                <p className="empty" style={{ textAlign: "center" }}>
+                  لا توجد مستويات دراسية مسجلة لعرضها.
+                </p>
+              ) : (
+                <div style={{ display: "grid", gap: 10 }}>
+                  {revenueLevels.map((level) => (
+                    <div
+                      key={level.levelCode}
+                      style={{
+                        display: "grid",
+                        gridTemplateColumns: "minmax(110px, 1fr) minmax(110px, 3fr) minmax(100px, 1fr)",
+                        alignItems: "center",
+                        gap: 10,
+                      }}
+                    >
+                      <strong style={{ fontSize: 12 }}>{level.label}</strong>
+                      <div style={{ height: 12, background: "#edf3f0", borderRadius: 8, overflow: "hidden" }}>
+                        <div
+                          style={{
+                            height: "100%",
+                            width: maximumLevelRevenue > 0
+                              ? `${Math.max((level.amount / maximumLevelRevenue) * 100, level.amount > 0 ? 1 : 0)}%`
+                              : "0%",
+                            background: "#4aa88e",
+                            borderRadius: 8,
+                          }}
+                        />
+                      </div>
+                      <span style={{ textAlign: "left", fontSize: 12 }}>
+                        {formatRevenueAmount(level.amount)}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
+              {revenueAnalytics.unassignedLevelPaymentCount > 0 && (
+                <p style={{ margin: "12px 0 0", color: "#83908d", fontSize: 11 }}>
+                  لم يمكن تصنيف {revenueAnalytics.unassignedLevelPaymentCount} أداءً
+                  ({formatRevenueAmount(revenueAnalytics.unassignedLevelAmount)}) لعدم توفر مستوى دراسي مرتبط بالتلميذ.
+                </p>
+              )}
+            </div>
+
+            <div style={{ marginTop: 20, borderTop: "1px solid #edf1ef", paddingTop: 18 }}>
+              <h3 style={{ margin: "0 0 12px" }}>تفصيل المداخيل الشهرية حسب المستوى</h3>
+              {revenueAnalytics.months.every((month) => month.paymentCount === 0) ? (
+                <p className="empty" style={{ textAlign: "center" }}>
+                  سيظهر التفصيل هنا بعد تسجيل الأداءات.
+                </p>
+              ) : (
+                <div className="table-wrap">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>الشهر الدراسي</th>
+                        <th>المستوى الدراسي</th>
+                        <th>عدد التلاميذ المؤدين</th>
+                        <th>عدد الأداءات المسجلة</th>
+                        <th>المبلغ المحصل (DH)</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {revenueAnalytics.months.flatMap((month) =>
+                        revenueLevels.map((level) => {
+                          const row = revenueAnalytics.monthlyByLevel.find(
+                            (item) =>
+                              item.monthKey === month.key &&
+                              item.levelCode === level.levelCode
+                          );
+                          return (
+                            <tr key={`${month.key}-${level.levelCode}`}>
+                              <td>{month.label} {month.year}</td>
+                              <td>{level.label}</td>
+                              <td>{row?.studentCount ?? 0}</td>
+                              <td>{row?.paymentCount ?? 0}</td>
+                              <td>{formatRevenueAmount(row?.amount ?? 0)}</td>
+                            </tr>
+                          );
+                        })
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          </>
+        )}
+      </section>
+
       <section className="dashboard-finance">
         <div className="panel-head">
           <div><h2>التلاميذ حسب المستوى</h2><p>عدد التلاميذ النشيطين حسب المستوى الدراسي.</p></div>
@@ -597,30 +927,6 @@ function Dashboard() {
       </section>
 
       <section className="charts">
-        <section className="panel revenue">
-          <div className="panel-head">
-            <div>
-              <h2>{t("income")}</h2>
-              <p>{t("overview")}</p>
-            </div>
-          </div>
-
-          <div className="chart">
-            <div className="bars">
-              {[42, 58, 46, 68, 58, 85, 74, 96, 67, 84, 77, 105].map(
-                (h, i) => (
-                  <div className="bar-col" key={i}>
-                    <i
-                      className={i === 7 ? "selected" : ""}
-                      style={{ height: h }}
-                    />
-                  </div>
-                )
-              )}
-            </div>
-          </div>
-        </section>
-
         <section className="panel distribution">
           <div className="panel-head">
             <div>
@@ -1104,6 +1410,7 @@ function PaymentInvoiceModal({
   initialPaymentId,
   initialAction,
   whatsAppWindow,
+  whatsAppMessageLanguage,
 }: {
   student: Student;
   close: () => void;
@@ -1111,6 +1418,7 @@ function PaymentInvoiceModal({
   initialPaymentId?: string | null;
   initialAction?: "view" | "download" | "print" | "whatsapp";
   whatsAppWindow?: Window | null;
+  whatsAppMessageLanguage?: "ar" | "fr";
 }) {
   const { lang } = useLanguage();
   const [month, setMonth] = useState(() => {
@@ -1619,7 +1927,7 @@ function PaymentInvoiceModal({
       totalAmount: receipt.dueAmount,
       paidAmount: receipt.totalPaid,
       balance: receipt.remainingAmount,
-      lang,
+      lang: whatsAppMessageLanguage ?? lang,
     });
     const whatsAppUrl = buildWhatsAppWebUrl(normalizedPhone, message);
     if (!whatsAppUrl) {
@@ -1666,7 +1974,7 @@ function PaymentInvoiceModal({
     } finally {
       setSharingInvoice(false);
     }
-  }, [lang, month, receipt, saveInvoicePdf, student.full_name, student.guardian_phone, student.monthly_fee, student.phone]);
+  }, [lang, month, receipt, saveInvoicePdf, student.full_name, student.guardian_phone, student.monthly_fee, student.phone, whatsAppMessageLanguage]);
 
   useEffect(() => {
     if (!initialPaymentId || !receipt || !initialAction || handledInitialAction.current) return;
@@ -2908,6 +3216,9 @@ function Payments() {
   const [invoiceStudent, setInvoiceStudent] = useState<Student | null>(null);
   const [invoiceMonth, setInvoiceMonth] = useState<string | undefined>(undefined);
   const [expandedPaymentHistoryStudentId, setExpandedPaymentHistoryStudentId] = useState<string | null>(null);
+  const [whatsAppHistoryStudent, setWhatsAppHistoryStudent] = useState<Student | null>(null);
+  const [selectedWhatsAppPaymentId, setSelectedWhatsAppPaymentId] = useState("");
+  const [whatsAppHistoryError, setWhatsAppHistoryError] = useState("");
   const [historyInvoice, setHistoryInvoice] = useState<{
     student: Student;
     paymentId: string;
@@ -3017,6 +3328,45 @@ function Payments() {
     if (!student) return;
     const whatsAppWindow = action === "whatsapp" ? window.open("about:blank", "_blank") : null;
     setHistoryInvoice({ student, paymentId, action, whatsAppWindow });
+  }
+
+  function openWhatsAppPaymentSelector(student: Student) {
+    setSelectedWhatsAppPaymentId("");
+    setWhatsAppHistoryError("");
+    setWhatsAppHistoryStudent(student);
+  }
+
+  function confirmWhatsAppPaymentSelection() {
+    if (!whatsAppHistoryStudent || !selectedWhatsAppPaymentId) {
+      setWhatsAppHistoryError("يرجى اختيار أداء قبل المتابعة.");
+      return;
+    }
+
+    const selectedPayment = payments.find(
+      (payment) =>
+        payment.id === selectedWhatsAppPaymentId &&
+        payment.student_id === whatsAppHistoryStudent.id
+    );
+    const selectedMonth = selectedPayment?.payment_month.slice(0, 7) ?? "";
+    if (!selectedPayment || !/^\d{4}-(0[1-9]|1[0-2])$/.test(selectedMonth)) {
+      setWhatsAppHistoryError("تعذر تحديد شهر الأداء لهذا السجل بشكل موثوق.");
+      return;
+    }
+
+    const guardianPhone = whatsAppHistoryStudent.guardian_phone || whatsAppHistoryStudent.phone;
+    if (!normalizeMoroccanMobileNumber(guardianPhone)) {
+      setWhatsAppHistoryError(
+        guardianPhone
+          ? "رقم هاتف ولي الأمر غير صالح. لن يتم فتح واتساب. تحقق من رقم محمول مغربي يبدأ بـ 06 أو 07."
+          : "رقم هاتف ولي الأمر غير متوفر. لن يتم فتح واتساب."
+      );
+      return;
+    }
+
+    openHistoricalInvoice(whatsAppHistoryStudent, selectedPayment.id, "whatsapp");
+    setWhatsAppHistoryStudent(null);
+    setSelectedWhatsAppPaymentId("");
+    setWhatsAppHistoryError("");
   }
 
   function getStudentRecordedPayments(studentId: string) {
@@ -3298,47 +3648,58 @@ function Payments() {
                             لا توجد أداءات مسجلة لهذا التلميذ.
                           </p>
                         ) : (
-                          <div style={{ display: "grid", gap: 10 }}>
-                            {studentRecordedPayments.map((payment) => {
-                              const paidMonthKey = payment.payment_month.slice(0, 7);
-                              const paidMonthLabel = /^\d{4}-(0[1-9]|1[0-2])$/.test(paidMonthKey)
-                                ? new Date(`${paidMonthKey}-01T00:00:00Z`).toLocaleDateString(
-                                    "ar-MA",
-                                    { month: "long", year: "numeric", timeZone: "UTC" }
-                                  )
-                                : "—";
+                          <>
+                            <button
+                              type="button"
+                              className="secondary small"
+                              onClick={() => openWhatsAppPaymentSelector(student)}
+                              style={{ width: "100%", marginBottom: 10 }}
+                            >
+                              إرسال الفاتورة عبر WhatsApp
+                            </button>
+                            <div style={{ display: "grid", gap: 10 }}>
+                              {studentRecordedPayments.map((payment) => {
+                                const paidMonthKey = payment.payment_month.slice(0, 7);
+                                const hasValidMonth = /^\d{4}-(0[1-9]|1[0-2])$/.test(paidMonthKey);
+                                const paidMonthLabel = hasValidMonth
+                                  ? new Date(`${paidMonthKey}-01T00:00:00Z`).toLocaleDateString(
+                                      "ar-MA",
+                                      { month: "long", year: "numeric", timeZone: "UTC" }
+                                    )
+                                  : "الشهر غير متوفر";
 
-                              return (
-                                <div
-                                  key={payment.id}
-                                  style={{
-                                    display: "grid",
-                                    gap: 6,
-                                    padding: 10,
-                                    borderRadius: 8,
-                                    background: "#fff",
-                                  }}
-                                >
-                                  <strong>{paidMonthLabel}</strong>
-                                  <span>
-                                    تاريخ الأداء: {payment.payment_date
-                                      ? formatDate(payment.payment_date, "ar")
-                                      : "غير متوفر"}
-                                  </span>
-                                  <span>
-                                    المبلغ المؤدى: {payment.amount_paid.toLocaleString("fr-FR")} درهم
-                                  </span>
-                                  <button
-                                    type="button"
-                                    className="secondary small"
-                                    onClick={() => openHistoricalInvoice(student, payment.id, "download")}
+                                return (
+                                  <div
+                                    key={payment.id}
+                                    style={{
+                                      display: "grid",
+                                      gap: 6,
+                                      padding: 10,
+                                      borderRadius: 8,
+                                      background: "#fff",
+                                    }}
                                   >
-                                    تحميل الفاتورة PDF
-                                  </button>
-                                </div>
-                              );
-                            })}
-                          </div>
+                                    <strong>{paidMonthLabel}</strong>
+                                    <span>
+                                      تاريخ الأداء: {payment.payment_date
+                                        ? formatDate(payment.payment_date, "ar")
+                                        : "غير متوفر"}
+                                    </span>
+                                    <span>
+                                      المبلغ المؤدى: {payment.amount_paid.toLocaleString("fr-FR")} درهم
+                                    </span>
+                                    <button
+                                      type="button"
+                                      className="secondary small"
+                                      onClick={() => openHistoricalInvoice(student, payment.id, "download")}
+                                    >
+                                      تحميل الفاتورة PDF
+                                    </button>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          </>
                         )}
                       </div>
                     )}
@@ -3349,6 +3710,114 @@ function Payments() {
           )}
         </div>
       </section>
+
+      {whatsAppHistoryStudent && (
+        <div
+          className="modal-layer"
+          dir="rtl"
+          onMouseDown={() => setWhatsAppHistoryStudent(null)}
+        >
+          <div
+            className="student-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="whatsapp-payment-picker-title"
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            <div className="modal-head">
+              <div>
+                <h2 id="whatsapp-payment-picker-title">اختيار الفاتورة لإرسالها</h2>
+                <p>{whatsAppHistoryStudent.full_name}</p>
+              </div>
+              <button
+                type="button"
+                className="close"
+                aria-label="إغلاق"
+                onClick={() => setWhatsAppHistoryStudent(null)}
+              >
+                ×
+              </button>
+            </div>
+            <div style={{ display: "grid", gap: 10, padding: 18 }}>
+              {getStudentRecordedPayments(whatsAppHistoryStudent.id).map((payment) => {
+                const paidMonthKey = payment.payment_month.slice(0, 7);
+                const hasValidMonth = /^\d{4}-(0[1-9]|1[0-2])$/.test(paidMonthKey);
+                const paidMonthLabel = hasValidMonth
+                  ? new Date(`${paidMonthKey}-01T00:00:00Z`).toLocaleDateString(
+                      "ar-MA",
+                      { month: "long", year: "numeric", timeZone: "UTC" }
+                    )
+                  : "الشهر غير متوفر بشكل موثوق";
+
+                return (
+                  <label
+                    key={payment.id}
+                    style={{
+                      display: "grid",
+                      gridTemplateColumns: "auto 1fr",
+                      alignItems: "start",
+                      gap: 10,
+                      padding: 12,
+                      border: "1px solid #e7ebef",
+                      borderRadius: 9,
+                      background: "#fff",
+                      opacity: hasValidMonth ? 1 : 0.65,
+                    }}
+                  >
+                    <input
+                      type="radio"
+                      name="whatsapp-history-payment"
+                      value={payment.id}
+                      checked={selectedWhatsAppPaymentId === payment.id}
+                      disabled={!hasValidMonth}
+                      onChange={() => {
+                        setSelectedWhatsAppPaymentId(payment.id);
+                        setWhatsAppHistoryError("");
+                      }}
+                    />
+                    <span style={{ display: "grid", gap: 5 }}>
+                      <strong>{paidMonthLabel}</strong>
+                      <span>
+                        تاريخ الأداء: {payment.payment_date
+                          ? formatDate(payment.payment_date, "ar")
+                          : "غير متوفر"}
+                      </span>
+                      <span>
+                        المبلغ المؤدى: {payment.amount_paid.toLocaleString("fr-FR")} درهم
+                      </span>
+                    </span>
+                  </label>
+                );
+              })}
+              <p style={{ margin: 0, color: "#66746f", fontSize: 12 }}>
+                سيتم تنزيل فاتورة الأداء المختار. أرفق ملف PDF يدوياً في واتساب قبل الضغط على إرسال.
+              </p>
+              {whatsAppHistoryError && (
+                <p className="form-error" role="alert" style={{ margin: 0 }}>
+                  {whatsAppHistoryError}
+                </p>
+              )}
+            </div>
+            <div className="modal-actions">
+              <button
+                type="button"
+                className="secondary"
+                onClick={() => setWhatsAppHistoryStudent(null)}
+              >
+                إلغاء
+              </button>
+              <button
+                type="button"
+                className="primary"
+                disabled={!selectedWhatsAppPaymentId}
+                onClick={confirmWhatsAppPaymentSelection}
+              >
+                تأكيد وإرسال عبر WhatsApp
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {loading ? (
         <section className="content-card">
@@ -3683,6 +4152,7 @@ function Payments() {
           initialPaymentId={historyInvoice.paymentId}
           initialAction={historyInvoice.action}
           whatsAppWindow={historyInvoice.whatsAppWindow}
+          whatsAppMessageLanguage={historyInvoice.action === "whatsapp" ? "ar" : undefined}
           close={() => {
             setHistoryInvoice(null);
             if (historyInvoice.whatsAppWindow && historyInvoice.action !== "whatsapp") {
