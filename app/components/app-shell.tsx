@@ -140,6 +140,155 @@ type Student = {
   updated_at: string;
 };
 
+function WhatsAppRecipientDialog({
+  studentName,
+  savedPhone,
+  close,
+  onConfirm,
+}: {
+  studentName: string;
+  savedPhone: string | null;
+  close: () => void;
+  onConfirm: (normalizedPhone: string) => void;
+}) {
+  const [recipientChoice, setRecipientChoice] = useState<"saved" | "custom" | "">("");
+  const [customPhone, setCustomPhone] = useState("");
+  const [validationError, setValidationError] = useState("");
+
+  function confirmRecipient() {
+    if (!recipientChoice) {
+      setValidationError("يرجى اختيار رقم الهاتف قبل المتابعة.");
+      return;
+    }
+
+    const rawPhone = recipientChoice === "saved" ? savedPhone : customPhone;
+    const normalizedPhone = normalizeMoroccanMobileNumber(rawPhone);
+    if (!normalizedPhone) {
+      setValidationError(
+        recipientChoice === "saved"
+          ? savedPhone
+            ? "رقم الهاتف المسجل غير صالح. اختر إدخال رقم آخر."
+            : "لا يوجد رقم هاتف مسجل لهذا التلميذ. اختر إدخال رقم آخر."
+          : "رقم الهاتف غير صالح. أدخل رقم محمول مغربي صحيحاً مثل 06XXXXXXXX أو +2126XXXXXXXX."
+      );
+      return;
+    }
+
+    setValidationError("");
+    onConfirm(normalizedPhone);
+  }
+
+  return (
+    <div
+      className="modal-layer"
+      dir="rtl"
+      onMouseDown={(event) => {
+        event.stopPropagation();
+        if (event.target === event.currentTarget) close();
+      }}
+    >
+      <div
+        className="student-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="whatsapp-recipient-title"
+        onMouseDown={(event) => event.stopPropagation()}
+      >
+        <div className="modal-head">
+          <div>
+            <h2 id="whatsapp-recipient-title">اختيار مستلم WhatsApp</h2>
+            <p>{studentName}</p>
+          </div>
+          <button type="button" className="close" aria-label="إغلاق" onClick={close}>×</button>
+        </div>
+        <div style={{ display: "grid", gap: 12, padding: 18 }}>
+          <label
+            style={{
+              display: "grid",
+              gridTemplateColumns: "auto 1fr",
+              alignItems: "start",
+              gap: 10,
+              padding: 12,
+              border: "1px solid #e7ebef",
+              borderRadius: 9,
+            }}
+          >
+            <input
+              type="radio"
+              name="whatsapp-recipient-choice"
+              value="saved"
+              checked={recipientChoice === "saved"}
+              onChange={() => {
+                setRecipientChoice("saved");
+                setValidationError("");
+              }}
+            />
+            <span style={{ display: "grid", gap: 5 }}>
+              <strong>استعمال رقم الهاتف المسجل</strong>
+              <span dir="ltr" style={{ textAlign: "right" }}>{savedPhone?.trim() || "لا يوجد رقم مسجل"}</span>
+            </span>
+          </label>
+
+          <label
+            style={{
+              display: "grid",
+              gridTemplateColumns: "auto 1fr",
+              alignItems: "start",
+              gap: 10,
+              padding: 12,
+              border: "1px solid #e7ebef",
+              borderRadius: 9,
+            }}
+          >
+            <input
+              type="radio"
+              name="whatsapp-recipient-choice"
+              value="custom"
+              checked={recipientChoice === "custom"}
+              onChange={() => {
+                setRecipientChoice("custom");
+                setValidationError("");
+              }}
+            />
+            <span style={{ display: "grid", gap: 8 }}>
+              <strong>إدخال رقم هاتف آخر</strong>
+              <input
+                type="tel"
+                inputMode="tel"
+                dir="ltr"
+                autoComplete="tel"
+                value={customPhone}
+                onFocus={() => {
+                  setRecipientChoice("custom");
+                  setValidationError("");
+                }}
+                onChange={(event) => {
+                  setCustomPhone(event.target.value);
+                  setValidationError("");
+                }}
+                placeholder="06XXXXXXXX أو +2126XXXXXXXX"
+                aria-label="رقم هاتف مستلم WhatsApp"
+                style={{
+                  width: "100%",
+                  height: 39,
+                  padding: "0 10px",
+                  border: "1px solid #e3e9e6",
+                  borderRadius: 7,
+                }}
+              />
+            </span>
+          </label>
+          {validationError && <p className="form-error" role="alert" style={{ margin: 0 }}>{validationError}</p>}
+        </div>
+        <div className="modal-actions">
+          <button type="button" className="secondary" onClick={close}>إلغاء</button>
+          <button type="button" className="primary" onClick={confirmRecipient}>متابعة</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 type Subject = {
   id: string;
   name: string;
@@ -1409,7 +1558,6 @@ function PaymentInvoiceModal({
   initialMonth,
   initialPaymentId,
   initialAction,
-  whatsAppWindow,
   whatsAppMessageLanguage,
 }: {
   student: Student;
@@ -1417,7 +1565,6 @@ function PaymentInvoiceModal({
   initialMonth?: string;
   initialPaymentId?: string | null;
   initialAction?: "view" | "download" | "print" | "whatsapp";
-  whatsAppWindow?: Window | null;
   whatsAppMessageLanguage?: "ar" | "fr";
 }) {
   const { lang } = useLanguage();
@@ -1450,6 +1597,8 @@ function PaymentInvoiceModal({
   const [invoiceShareNotice, setInvoiceShareNotice] = useState("");
   const [whatsAppInvoiceUrl, setWhatsAppInvoiceUrl] = useState<string | null>(null);
   const [sharingInvoice, setSharingInvoice] = useState(false);
+  const [showWhatsAppRecipientDialog, setShowWhatsAppRecipientDialog] = useState(false);
+  const [whatsAppRecipientPurpose, setWhatsAppRecipientPurpose] = useState<"invoice" | "message">("invoice");
   const [deletePaymentId, setDeletePaymentId] = useState<string | null>(null);
   const [deleteReason, setDeleteReason] = useState("");
   const [receipt, setReceipt] = useState<{
@@ -1531,7 +1680,6 @@ function PaymentInvoiceModal({
           console.error(fetchError ?? "Missing payment row for invoice.");
           setError("تعذر تحميل الفاتورة المطلوبة.");
           setLoadingInvoice(false);
-          whatsAppWindow?.close();
           return;
         }
 
@@ -1569,7 +1717,7 @@ function PaymentInvoiceModal({
     }, 0);
 
     return () => window.clearTimeout(timer);
-  }, [initialPaymentId, initialMonth, loadMonthPayments, month, paymentDate, student.id, student.monthly_fee, whatsAppWindow]);
+  }, [initialPaymentId, initialMonth, loadMonthPayments, month, paymentDate, student.id, student.monthly_fee]);
 
   const monthlyFee = Number(student.monthly_fee ?? 0);
   const enteredAmount = Number(amountPaid || 0);
@@ -1763,6 +1911,8 @@ function PaymentInvoiceModal({
       month: monthKey,
       message,
     });
+    setWhatsAppRecipientPurpose("message");
+    setShowWhatsAppRecipientDialog(true);
   }
 
   const sanitizeInvoiceFileName = useCallback((value: string) => {
@@ -1880,23 +2030,17 @@ function PaymentInvoiceModal({
     }
   }, [buildInvoicePdfFileName, month, student.full_name]);
 
-  const shareInvoiceViaWhatsApp = useCallback(async (existingWindow?: Window | null) => {
+  const shareInvoiceViaWhatsApp = useCallback(async (recipientPhone: string) => {
     setInvoiceShareError("");
     setInvoiceShareNotice("");
     setWhatsAppInvoiceUrl(null);
 
-    const rawPhone = student.guardian_phone || student.phone;
-    const normalizedPhone = normalizeMoroccanMobileNumber(rawPhone);
+    const normalizedPhone = normalizeMoroccanMobileNumber(recipientPhone);
     if (!normalizedPhone) {
-      existingWindow?.close();
       setInvoiceShareError(
         lang === "ar"
-          ? rawPhone
-            ? "رقم هاتف ولي الأمر غير صالح. أدخل رقم هاتف محمول مغربي يبدأ بـ 06 أو 07."
-            : "رقم هاتف ولي الأمر غير متوفر."
-          : rawPhone
-            ? "Le numéro du parent est invalide. Saisissez un mobile marocain commençant par 06 ou 07."
-            : "Le numéro de téléphone du parent est manquant."
+          ? "رقم الهاتف غير صالح. أدخل رقم محمول مغربي يبدأ بـ 06 أو 07."
+          : "Le numéro saisi est invalide. Saisissez un mobile marocain commençant par 06 ou 07."
       );
       return;
     }
@@ -1912,7 +2056,6 @@ function PaymentInvoiceModal({
       student.monthly_fee == null ||
       !invoiceAmounts.every((amount) => Number.isFinite(amount) && amount >= 0)
     ) {
-      existingWindow?.close();
       setInvoiceShareError(
         lang === "ar"
           ? "بيانات الفاتورة غير مكتملة. تحقق من اسم التلميذ والشهر والمبالغ."
@@ -1931,14 +2074,13 @@ function PaymentInvoiceModal({
     });
     const whatsAppUrl = buildWhatsAppWebUrl(normalizedPhone, message);
     if (!whatsAppUrl) {
-      existingWindow?.close();
       setInvoiceShareError(
         lang === "ar" ? "تعذر إعداد رابط واتساب." : "Impossible de préparer le lien WhatsApp."
       );
       return;
     }
 
-    const whatsAppPopup = existingWindow ?? window.open("about:blank", "_blank");
+    const whatsAppPopup = window.open("about:blank", "_blank");
     setSharingInvoice(true);
     try {
       const pdfGenerated = await saveInvoicePdf();
@@ -1974,7 +2116,7 @@ function PaymentInvoiceModal({
     } finally {
       setSharingInvoice(false);
     }
-  }, [lang, month, receipt, saveInvoicePdf, student.full_name, student.guardian_phone, student.monthly_fee, student.phone, whatsAppMessageLanguage]);
+  }, [lang, month, receipt, saveInvoicePdf, student.full_name, student.monthly_fee, whatsAppMessageLanguage]);
 
   useEffect(() => {
     if (!initialPaymentId || !receipt || !initialAction || handledInitialAction.current) return;
@@ -1986,12 +2128,24 @@ function PaymentInvoiceModal({
       } else if (initialAction === "print") {
         printInvoice();
       } else if (initialAction === "whatsapp") {
-        void shareInvoiceViaWhatsApp(whatsAppWindow);
+        setWhatsAppRecipientPurpose("invoice");
+        setShowWhatsAppRecipientDialog(true);
       }
     }, 0);
 
     return () => window.clearTimeout(timer);
-  }, [initialAction, initialPaymentId, printInvoice, receipt, saveInvoicePdf, shareInvoiceViaWhatsApp, whatsAppWindow]);
+  }, [initialAction, initialPaymentId, printInvoice, receipt, saveInvoicePdf]);
+
+  function confirmWhatsAppRecipient(recipientPhone: string) {
+    setShowWhatsAppRecipientDialog(false);
+    if (whatsAppRecipientPurpose === "invoice") {
+      void shareInvoiceViaWhatsApp(recipientPhone);
+      return;
+    }
+    setWhatsAppDraft((current) =>
+      current ? { ...current, guardianPhone: recipientPhone } : current
+    );
+  }
 
   if (receipt) {
     const receiptMonth = (receipt.paymentMonth || month).slice(0, 7);
@@ -2237,7 +2391,10 @@ function PaymentInvoiceModal({
               <button
                 type="button"
                 className="primary"
-                onClick={() => void shareInvoiceViaWhatsApp()}
+                onClick={() => {
+                  setWhatsAppRecipientPurpose("invoice");
+                  setShowWhatsAppRecipientDialog(true);
+                }}
                 disabled={sharingInvoice}
               >
                 {sharingInvoice ? "جارٍ إعداد الفاتورة..." : "إرسال الفاتورة عبر WhatsApp"}
@@ -2263,6 +2420,9 @@ function PaymentInvoiceModal({
                   <strong>مراجعة رسالة واتساب</strong>
                   <button type="button" className="secondary small" onClick={() => setWhatsAppDraft(null)}>إغلاق</button>
                 </div>
+                <p style={{ margin: "0 0 10px", color: "#657184", fontSize: 12 }} dir="ltr">
+                  {whatsAppDraft.guardianPhone}
+                </p>
                 <textarea
                   value={whatsAppDraft.message}
                   onChange={(event) => setWhatsAppDraft((current) => current ? { ...current, message: event.target.value } : current)}
@@ -2277,6 +2437,14 @@ function PaymentInvoiceModal({
             )}
           </div>
         </div>
+        {showWhatsAppRecipientDialog && (
+          <WhatsAppRecipientDialog
+            studentName={student.full_name}
+            savedPhone={student.guardian_phone || student.phone}
+            close={() => setShowWhatsAppRecipientDialog(false)}
+            onConfirm={confirmWhatsAppRecipient}
+          />
+        )}
       </div>
     );
   }
@@ -3223,7 +3391,6 @@ function Payments() {
     student: Student;
     paymentId: string;
     action: "view" | "download" | "print" | "whatsapp";
-    whatsAppWindow: Window | null;
   } | null>(null);
 
   async function loadPaymentsPage() {
@@ -3326,8 +3493,7 @@ function Payments() {
     action: "view" | "download" | "print" | "whatsapp"
   ) {
     if (!student) return;
-    const whatsAppWindow = action === "whatsapp" ? window.open("about:blank", "_blank") : null;
-    setHistoryInvoice({ student, paymentId, action, whatsAppWindow });
+    setHistoryInvoice({ student, paymentId, action });
   }
 
   function openWhatsAppPaymentSelector(student: Student) {
@@ -3350,16 +3516,6 @@ function Payments() {
     const selectedMonth = selectedPayment?.payment_month.slice(0, 7) ?? "";
     if (!selectedPayment || !/^\d{4}-(0[1-9]|1[0-2])$/.test(selectedMonth)) {
       setWhatsAppHistoryError("تعذر تحديد شهر الأداء لهذا السجل بشكل موثوق.");
-      return;
-    }
-
-    const guardianPhone = whatsAppHistoryStudent.guardian_phone || whatsAppHistoryStudent.phone;
-    if (!normalizeMoroccanMobileNumber(guardianPhone)) {
-      setWhatsAppHistoryError(
-        guardianPhone
-          ? "رقم هاتف ولي الأمر غير صالح. لن يتم فتح واتساب. تحقق من رقم محمول مغربي يبدأ بـ 06 أو 07."
-          : "رقم هاتف ولي الأمر غير متوفر. لن يتم فتح واتساب."
-      );
       return;
     }
 
@@ -4151,14 +4307,8 @@ function Payments() {
           initialMonth={selectedHistoryMonth}
           initialPaymentId={historyInvoice.paymentId}
           initialAction={historyInvoice.action}
-          whatsAppWindow={historyInvoice.whatsAppWindow}
           whatsAppMessageLanguage={historyInvoice.action === "whatsapp" ? "ar" : undefined}
-          close={() => {
-            setHistoryInvoice(null);
-            if (historyInvoice.whatsAppWindow && historyInvoice.action !== "whatsapp") {
-              historyInvoice.whatsAppWindow.close();
-            }
-          }}
+          close={() => setHistoryInvoice(null)}
         />
       )}
     </div>
