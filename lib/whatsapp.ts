@@ -100,6 +100,24 @@ export function buildInvoiceWhatsAppMessage({
   ].join("\n");
 }
 
+export function buildMultipleInvoiceWhatsAppMessage({
+  studentName,
+  months,
+}: {
+  studentName: string;
+  months: string[];
+}) {
+  return [
+    "السلام عليكم،",
+    `هذه فواتير الأداء الخاصة بالتلميذ(ة) ${studentName} عن الأشهر التالية:`,
+    ...months.map((month) => `• ${month}`),
+    `عدد الفواتير: ${months.length}`,
+    "",
+    "تم تنزيل ملفات PDF. يرجى إرفاقها يدوياً في واتساب قبل الضغط على إرسال.",
+    "شكراً لاختياركم مركز سنابل الكوثر.",
+  ].join("\n");
+}
+
 export function buildWhatsAppWebUrl(rawNumber: string, message: string) {
   const normalizedNumber = normalizeMoroccanMobileNumber(rawNumber);
   if (!normalizedNumber || !message.trim()) return null;

@@ -11,6 +11,7 @@ import { Icon } from "./icons";
 import { LanguageProvider, useLanguage } from "./i18n";
 import {
   buildInvoiceWhatsAppMessage,
+  buildMultipleInvoiceWhatsAppMessage,
   buildMonthlyReminderMessage,
   buildPaymentConfirmationMessage,
   buildWhatsAppWebUrl,
@@ -1559,6 +1560,8 @@ function PaymentInvoiceModal({
   initialPaymentId,
   initialAction,
   whatsAppMessageLanguage,
+  onInitialActionComplete,
+  onPdfGenerated,
 }: {
   student: Student;
   close: () => void;
@@ -1566,6 +1569,8 @@ function PaymentInvoiceModal({
   initialPaymentId?: string | null;
   initialAction?: "view" | "download" | "print" | "whatsapp";
   whatsAppMessageLanguage?: "ar" | "fr";
+  onInitialActionComplete?: (succeeded: boolean) => void;
+  onPdfGenerated?: (file: File) => void;
 }) {
   const { lang } = useLanguage();
   const [month, setMonth] = useState(() => {
@@ -1680,6 +1685,7 @@ function PaymentInvoiceModal({
           console.error(fetchError ?? "Missing payment row for invoice.");
           setError("تعذر تحميل الفاتورة المطلوبة.");
           setLoadingInvoice(false);
+          if (initialAction === "download") onInitialActionComplete?.(false);
           return;
         }
 
@@ -1717,7 +1723,7 @@ function PaymentInvoiceModal({
     }, 0);
 
     return () => window.clearTimeout(timer);
-  }, [initialPaymentId, initialMonth, loadMonthPayments, month, paymentDate, student.id, student.monthly_fee]);
+  }, [initialAction, initialPaymentId, initialMonth, loadMonthPayments, month, onInitialActionComplete, paymentDate, student.id, student.monthly_fee]);
 
   const monthlyFee = Number(student.monthly_fee ?? 0);
   const enteredAmount = Number(amountPaid || 0);
@@ -2019,16 +2025,19 @@ function PaymentInvoiceModal({
       const y = (pageHeight - imgHeight) / 2;
 
       pdf.addImage(imgData, "PNG", x, y, imgWidth, imgHeight, undefined, "FAST");
-      pdf.save(buildInvoicePdfFileName(student.full_name, month));
-      return true;
+      const fileName = buildInvoicePdfFileName(student.full_name, month);
+      const file = new File([pdf.output("blob")], fileName, { type: "application/pdf" });
+      pdf.save(fileName);
+      onPdfGenerated?.(file);
+      return file;
     } catch (error) {
       console.error("Failed to generate invoice PDF:", error);
       setInvoiceShareError("تعذر إنشاء ملف PDF للفاتورة. يرجى المحاولة مرة أخرى.");
-      return false;
+      return null;
     } finally {
       clone?.remove();
     }
-  }, [buildInvoicePdfFileName, month, student.full_name]);
+  }, [buildInvoicePdfFileName, month, onPdfGenerated, student.full_name]);
 
   const shareInvoiceViaWhatsApp = useCallback(async (recipientPhone: string) => {
     setInvoiceShareError("");
@@ -2124,7 +2133,7 @@ function PaymentInvoiceModal({
       handledInitialAction.current = true;
 
       if (initialAction === "download") {
-        void saveInvoicePdf();
+        void saveInvoicePdf().then((file) => onInitialActionComplete?.(Boolean(file)));
       } else if (initialAction === "print") {
         printInvoice();
       } else if (initialAction === "whatsapp") {
@@ -2134,7 +2143,7 @@ function PaymentInvoiceModal({
     }, 0);
 
     return () => window.clearTimeout(timer);
-  }, [initialAction, initialPaymentId, printInvoice, receipt, saveInvoicePdf]);
+  }, [initialAction, initialPaymentId, onInitialActionComplete, printInvoice, receipt, saveInvoicePdf]);
 
   function confirmWhatsAppRecipient(recipientPhone: string) {
     setShowWhatsAppRecipientDialog(false);
@@ -3387,6 +3396,23 @@ function Payments() {
   const [whatsAppHistoryStudent, setWhatsAppHistoryStudent] = useState<Student | null>(null);
   const [selectedWhatsAppPaymentId, setSelectedWhatsAppPaymentId] = useState("");
   const [whatsAppHistoryError, setWhatsAppHistoryError] = useState("");
+  const [multiInvoiceStudent, setMultiInvoiceStudent] = useState<Student | null>(null);
+  const [selectedMultiInvoiceIds, setSelectedMultiInvoiceIds] = useState<string[]>([]);
+  const [multiInvoiceRecipientStudent, setMultiInvoiceRecipientStudent] = useState<Student | null>(null);
+  const [multiInvoiceError, setMultiInvoiceError] = useState("");
+  const [multiInvoiceJob, setMultiInvoiceJob] = useState<{
+    student: Student;
+    paymentIds: string[];
+    recipientPhone: string;
+    whatsappUrl: string;
+    message: string;
+    currentIndex: number;
+    files: File[];
+    phase: "generating" | "ready" | "error";
+    error: string;
+  } | null>(null);
+  const generatedMultiInvoiceFilesRef = useRef<File[]>([]);
+  const multiInvoiceWhatsAppWindowRef = useRef<Window | null>(null);
   const [historyInvoice, setHistoryInvoice] = useState<{
     student: Student;
     paymentId: string;
@@ -3532,6 +3558,148 @@ function Payments() {
         const dateOrder = second.payment_date.localeCompare(first.payment_date);
         return dateOrder || second.payment_month.localeCompare(first.payment_month);
       });
+  }
+
+  function getIdentifiableStudentPayments(studentId: string) {
+    return getStudentRecordedPayments(studentId).filter((payment) =>
+      /^\d{4}-(0[1-9]|1[0-2])(?:-\d{2})?$/.test(payment.payment_month)
+    );
+  }
+
+  function openMultiInvoiceSelector(student: Student) {
+    setMultiInvoiceStudent(student);
+    setSelectedMultiInvoiceIds([]);
+    setMultiInvoiceError("");
+  }
+
+  function requestMultiInvoiceRecipient() {
+    if (!multiInvoiceStudent || selectedMultiInvoiceIds.length === 0) {
+      setMultiInvoiceError("يرجى تحديد فاتورة واحدة على الأقل.");
+      return;
+    }
+
+    setMultiInvoiceError("");
+    setMultiInvoiceRecipientStudent(multiInvoiceStudent);
+  }
+
+  function startMultiInvoiceGeneration(recipientPhone: string) {
+    const student = multiInvoiceRecipientStudent;
+    if (!student) return;
+
+    const selectedPayments = getIdentifiableStudentPayments(student.id)
+      .filter((payment) => selectedMultiInvoiceIds.includes(payment.id));
+    if (selectedPayments.length === 0) {
+      setMultiInvoiceError("تعذر العثور على الفواتير المحددة ضمن أداءات هذا التلميذ.");
+      setMultiInvoiceRecipientStudent(null);
+      return;
+    }
+
+    const months = selectedPayments.map((payment) => {
+      const monthKey = payment.payment_month.slice(0, 7);
+      return new Date(`${monthKey}-01T00:00:00Z`).toLocaleDateString("ar-MA", {
+        month: "long",
+        year: "numeric",
+        timeZone: "UTC",
+      });
+    });
+    const message = buildMultipleInvoiceWhatsAppMessage({
+      studentName: student.full_name,
+      months,
+    });
+    const whatsappUrl = buildWhatsAppWebUrl(recipientPhone, message);
+    if (!whatsappUrl) {
+      setMultiInvoiceError("تعذر إعداد رابط WhatsApp. تحقق من رقم الهاتف.");
+      setMultiInvoiceRecipientStudent(null);
+      return;
+    }
+
+    generatedMultiInvoiceFilesRef.current = [];
+    multiInvoiceWhatsAppWindowRef.current = window.open("about:blank", "_blank");
+    setMultiInvoiceJob({
+      student,
+      paymentIds: selectedPayments.map((payment) => payment.id),
+      recipientPhone,
+      whatsappUrl,
+      message,
+      currentIndex: 0,
+      files: [],
+      phase: "generating",
+      error: "",
+    });
+    setHistoryInvoice({
+      student,
+      paymentId: selectedPayments[0].id,
+      action: "download",
+    });
+    setMultiInvoiceRecipientStudent(null);
+    setMultiInvoiceStudent(null);
+    setSelectedMultiInvoiceIds([]);
+  }
+
+  function completeMultiInvoiceDownload(succeeded: boolean) {
+    const current = multiInvoiceJob;
+    if (!current || current.phase !== "generating") return;
+    if (!succeeded) {
+      multiInvoiceWhatsAppWindowRef.current?.close();
+      multiInvoiceWhatsAppWindowRef.current = null;
+      setHistoryInvoice(null);
+      setMultiInvoiceJob({
+        ...current,
+        phase: "error",
+        error: "تعذر إنشاء إحدى الفواتير. توقف التنزيل عند هذه الفاتورة؛ راجع السجل وحاول مجدداً.",
+      });
+      return;
+    }
+
+    const nextIndex = current.currentIndex + 1;
+    const files = [...generatedMultiInvoiceFilesRef.current];
+    if (nextIndex < current.paymentIds.length) {
+      setHistoryInvoice({
+        student: current.student,
+        paymentId: current.paymentIds[nextIndex],
+        action: "download",
+      });
+      setMultiInvoiceJob({ ...current, currentIndex: nextIndex, files });
+      return;
+    }
+
+    setHistoryInvoice(null);
+    const popup = multiInvoiceWhatsAppWindowRef.current;
+    if (popup) {
+      popup.opener = null;
+      popup.location.href = current.whatsappUrl;
+    }
+    multiInvoiceWhatsAppWindowRef.current = null;
+    setMultiInvoiceJob({
+      ...current,
+      currentIndex: nextIndex,
+      files,
+      phase: "ready",
+    });
+  }
+
+  async function shareGeneratedInvoices() {
+    if (!multiInvoiceJob || multiInvoiceJob.files.length === 0) return;
+    if (!navigator.canShare?.({ files: multiInvoiceJob.files })) {
+      setMultiInvoiceJob((current) =>
+        current ? { ...current, error: "المتصفح لا يدعم مشاركة عدة ملفات PDF. أرفق الملفات التي تم تنزيلها يدوياً في WhatsApp." } : current
+      );
+      return;
+    }
+
+    try {
+      await navigator.share({
+        files: multiInvoiceJob.files,
+        title: `فواتير ${multiInvoiceJob.student.full_name}`,
+        text: multiInvoiceJob.message,
+      });
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") return;
+      console.error("Unable to share multiple invoice files:", error);
+      setMultiInvoiceJob((current) =>
+        current ? { ...current, error: "تعذرت مشاركة الملفات من المتصفح. يمكنك إرفاق ملفات PDF التي تم تنزيلها يدوياً." } : current
+      );
+    }
   }
 
   const getStudentPaymentSnapshot = (student: Student) => {
@@ -3813,6 +3981,15 @@ function Payments() {
                             >
                               إرسال الفاتورة عبر WhatsApp
                             </button>
+                            <button
+                              type="button"
+                              className="secondary small"
+                              onClick={() => openMultiInvoiceSelector(student)}
+                              disabled={getIdentifiableStudentPayments(student.id).length === 0}
+                              style={{ width: "100%", marginBottom: 10 }}
+                            >
+                              إرسال عدة فواتير عبر WhatsApp
+                            </button>
                             <div style={{ display: "grid", gap: 10 }}>
                               {studentRecordedPayments.map((payment) => {
                                 const paidMonthKey = payment.payment_month.slice(0, 7);
@@ -3973,6 +4150,177 @@ function Payments() {
             </div>
           </div>
         </div>
+      )}
+
+      {multiInvoiceStudent && (() => {
+        const eligiblePayments = getIdentifiableStudentPayments(multiInvoiceStudent.id);
+        const selectedPayments = eligiblePayments.filter((payment) =>
+          selectedMultiInvoiceIds.includes(payment.id)
+        );
+        const selectedAmount = selectedPayments.reduce((sum, payment) => {
+          const amount = Number(payment.amount_paid);
+          return sum + (Number.isFinite(amount) ? amount : 0);
+        }, 0);
+
+        return (
+          <div
+            className="modal-layer"
+            dir="rtl"
+            onMouseDown={(event) => {
+              if (event.target === event.currentTarget) setMultiInvoiceStudent(null);
+            }}
+          >
+            <div
+              className="student-modal"
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="multiple-invoice-picker-title"
+              onMouseDown={(event) => event.stopPropagation()}
+            >
+              <div className="modal-head">
+                <div>
+                  <h2 id="multiple-invoice-picker-title">اختيار عدة فواتير</h2>
+                  <p>{multiInvoiceStudent.full_name}</p>
+                </div>
+                <button type="button" className="close" aria-label="إغلاق" onClick={() => setMultiInvoiceStudent(null)}>×</button>
+              </div>
+              <div style={{ display: "grid", gap: 12, padding: 18, maxHeight: "55vh", overflowY: "auto" }}>
+                <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                  <button
+                    type="button"
+                    className="secondary small"
+                    onClick={() => setSelectedMultiInvoiceIds(eligiblePayments.map((payment) => payment.id))}
+                  >
+                    تحديد الكل
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary small"
+                    onClick={() => setSelectedMultiInvoiceIds([])}
+                  >
+                    إلغاء تحديد الكل
+                  </button>
+                </div>
+                {eligiblePayments.length === 0 ? (
+                  <p className="empty" style={{ margin: 0 }}>لا توجد أداءات مسجلة ذات شهر قابل للتحديد.</p>
+                ) : (
+                  eligiblePayments.map((payment) => {
+                    const monthKey = payment.payment_month.slice(0, 7);
+                    const monthLabel = new Date(`${monthKey}-01T00:00:00Z`).toLocaleDateString(
+                      "ar-MA",
+                      { month: "long", year: "numeric", timeZone: "UTC" }
+                    );
+                    return (
+                      <label
+                        key={payment.id}
+                        style={{
+                          display: "grid",
+                          gridTemplateColumns: "auto 1fr",
+                          alignItems: "start",
+                          gap: 10,
+                          padding: 12,
+                          border: "1px solid #e7ebef",
+                          borderRadius: 9,
+                          background: "#fff",
+                        }}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={selectedMultiInvoiceIds.includes(payment.id)}
+                          onChange={(event) => setSelectedMultiInvoiceIds((current) =>
+                            event.target.checked
+                              ? [...current, payment.id]
+                              : current.filter((paymentId) => paymentId !== payment.id)
+                          )}
+                        />
+                        <span style={{ display: "grid", gap: 5 }}>
+                          <strong>{monthLabel}</strong>
+                          <span>
+                            تاريخ الأداء: {payment.payment_date
+                              ? formatDate(payment.payment_date, "ar")
+                              : "غير متوفر"}
+                          </span>
+                          <span>المبلغ المؤدى: {payment.amount_paid.toLocaleString("fr-FR")} درهم</span>
+                        </span>
+                      </label>
+                    );
+                  })
+                )}
+                <div style={{ padding: 12, background: "#f7faf8", borderRadius: 9 }}>
+                  <strong>عدد الفواتير المختارة: {selectedPayments.length}</strong>
+                  <div style={{ marginTop: 5 }}>
+                    مجموع المبالغ المؤداة: {selectedAmount.toLocaleString("fr-FR")} درهم
+                  </div>
+                </div>
+                <p style={{ margin: 0, color: "#66746f", fontSize: 12 }}>
+                  سيتم تنزيل ملف PDF مستقل لكل فاتورة مختارة، ثم فتح WhatsApp. أرفق جميع الملفات يدوياً قبل الضغط على إرسال.
+                </p>
+                {multiInvoiceError && <p className="form-error" role="alert" style={{ margin: 0 }}>{multiInvoiceError}</p>}
+              </div>
+              <div className="modal-actions">
+                <button type="button" className="secondary" onClick={() => setMultiInvoiceStudent(null)}>إلغاء</button>
+                <button
+                  type="button"
+                  className="primary"
+                  disabled={selectedPayments.length === 0}
+                  onClick={requestMultiInvoiceRecipient}
+                >
+                  متابعة إلى اختيار المستلم
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+      {multiInvoiceRecipientStudent && (
+        <WhatsAppRecipientDialog
+          studentName={multiInvoiceRecipientStudent.full_name}
+          savedPhone={multiInvoiceRecipientStudent.guardian_phone || multiInvoiceRecipientStudent.phone}
+          close={() => setMultiInvoiceRecipientStudent(null)}
+          onConfirm={startMultiInvoiceGeneration}
+        />
+      )}
+
+      {multiInvoiceJob && (
+        <section className="content-card" dir="rtl" role="status" style={{ marginBottom: 16 }}>
+          {multiInvoiceJob.phase === "generating" ? (
+            <>
+              <strong>
+                جارٍ إنشاء وتنزيل الفاتورة {multiInvoiceJob.currentIndex + 1} من {multiInvoiceJob.paymentIds.length}...
+              </strong>
+              <p style={{ marginBottom: 0 }}>لا تغلق الصفحة حتى يكتمل إنشاء الملفات المحددة.</p>
+            </>
+          ) : multiInvoiceJob.phase === "ready" ? (
+            <>
+              <strong>تم تنزيل {multiInvoiceJob.files.length} فاتورة.</strong>
+              <p>
+                أُعد رابط WhatsApp لـ {multiInvoiceJob.recipientPhone} مع أسماء الأشهر المختارة.
+                أرفق ملفات PDF يدوياً في المحادثة قبل الضغط على إرسال.
+              </p>
+              <a href={multiInvoiceJob.whatsappUrl} target="_blank" rel="noreferrer" className="secondary small">
+                فتح WhatsApp Web
+              </a>
+              {typeof navigator !== "undefined" && navigator.canShare?.({ files: multiInvoiceJob.files }) && (
+                <button type="button" className="secondary small" onClick={() => void shareGeneratedInvoices()}>
+                  مشاركة ملفات PDF عبر التطبيقات المتاحة
+                </button>
+              )}
+              {multiInvoiceJob.error && <p className="form-error" role="alert">{multiInvoiceJob.error}</p>}
+              <button type="button" className="secondary small" onClick={() => setMultiInvoiceJob(null)}>
+                إغلاق
+              </button>
+            </>
+          ) : (
+            <>
+              <p className="form-error" role="alert">{multiInvoiceJob.error}</p>
+              {multiInvoiceJob.files.length > 0 && (
+                <p>تم تنزيل {multiInvoiceJob.files.length} ملف قبل التوقف. أرفقها يدوياً في WhatsApp.</p>
+              )}
+              <button type="button" className="secondary small" onClick={() => setMultiInvoiceJob(null)}>إغلاق</button>
+            </>
+          )}
+        </section>
       )}
 
       {loading ? (
@@ -4303,11 +4651,18 @@ function Payments() {
       )}
       {historyInvoice && (
         <PaymentInvoiceModal
+          key={historyInvoice.paymentId}
           student={historyInvoice.student}
           initialMonth={selectedHistoryMonth}
           initialPaymentId={historyInvoice.paymentId}
           initialAction={historyInvoice.action}
           whatsAppMessageLanguage={historyInvoice.action === "whatsapp" ? "ar" : undefined}
+          onPdfGenerated={multiInvoiceJob?.phase === "generating"
+            ? (file) => { generatedMultiInvoiceFilesRef.current.push(file); }
+            : undefined}
+          onInitialActionComplete={multiInvoiceJob?.phase === "generating"
+            ? completeMultiInvoiceDownload
+            : undefined}
           close={() => setHistoryInvoice(null)}
         />
       )}
