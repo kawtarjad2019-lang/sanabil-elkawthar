@@ -1,0 +1,19 @@
+{
+  "name": "Sanabil Elkawthar",
+  "short_name": "Sanabil",
+  "description": "Sanabil Elkawthar management platform",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f6f9f8",
+  "theme_color": "#16806b",
+  "orientation": "portrait-primary",
+  "lang": "ar",
+  "icons": [
+    {
+      "src": "/images/logo.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}

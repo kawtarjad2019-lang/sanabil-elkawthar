@@ -4,12 +4,19 @@ import html2canvas from "html2canvas";
 import jsPDF from "jspdf";
 import Image from "next/image";
 import Link from "next/link";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import * as XLSX from "xlsx";
 
 import { Icon } from "./icons";
 import { LanguageProvider, useLanguage } from "./i18n";
-import { buildMonthlyReminderMessage, buildPaymentConfirmationMessage, type WhatsAppMessageType } from "@/lib/whatsapp";
+import {
+  buildInvoiceWhatsAppMessage,
+  buildMonthlyReminderMessage,
+  buildPaymentConfirmationMessage,
+  buildWhatsAppWebUrl,
+  normalizeMoroccanMobileNumber,
+  type WhatsAppMessageType,
+} from "@/lib/whatsapp";
 import { createClient } from "@/lib/supabase/client";
 
 export type Section =
@@ -202,6 +209,69 @@ function isCompensationSchemaError(error: SupabaseErrorShape | null) {
   ].some((field) => text.includes(field)) || text.includes("pgrst204") || text.includes("42703");
 }
 
+const SCHOOL_YEAR_MONTH_ORDER = [8, 9, 10, 11, 0, 1, 2, 3, 4, 5, 6, 7] as const;
+
+function getSchoolYearStartYear(date: Date = new Date()) {
+  return date.getMonth() >= 8 ? date.getFullYear() : date.getFullYear() - 1;
+}
+
+function getCurrentSchoolYearMonthNumber(date: Date = new Date()) {
+  const monthIndex = SCHOOL_YEAR_MONTH_ORDER.indexOf(date.getMonth() as (typeof SCHOOL_YEAR_MONTH_ORDER)[number]);
+  return monthIndex >= 0 ? monthIndex + 1 : 1;
+}
+
+function getSchoolYearRange(date: Date = new Date()) {
+  const startYear = getSchoolYearStartYear(date);
+  const start = new Date(Date.UTC(startYear, 8, 1, 0, 0, 0, 0));
+  const end = new Date(Date.UTC(startYear + 1, 7, 31, 23, 59, 59, 999));
+  return { start, end, startYear };
+}
+
+function getSchoolYearMonths(date: Date = new Date()) {
+  const startYear = getSchoolYearStartYear(date);
+  return Array.from({ length: 12 }, (_, index) => {
+    const monthDate = new Date(Date.UTC(startYear, 8 + index, 1));
+    return {
+      key: `${monthDate.getUTCFullYear()}-${String(monthDate.getUTCMonth() + 1).padStart(2, "0")}`,
+      monthNumber: monthDate.getUTCMonth() + 1,
+      year: monthDate.getUTCFullYear(),
+    };
+  });
+}
+
+function paymentIsInSchoolYear(
+  payment: { payment_month?: string | null; payment_date?: string | null },
+  referenceDate: Date = new Date()
+) {
+  const { start, end } = getSchoolYearRange(referenceDate);
+  const value = payment.payment_month ?? payment.payment_date ?? "";
+
+  if (!value) {
+    return false;
+  }
+
+  const paymentDate = new Date(`${value}T00:00:00Z`);
+  if (Number.isNaN(paymentDate.getTime())) {
+    return false;
+  }
+
+  return paymentDate >= start && paymentDate <= end;
+}
+
+function getStudentSchoolYearPaidTotal(
+  studentId: string,
+  payments: Array<{ student_id: string; payment_month?: string | null; payment_date?: string | null; amount_paid?: number | string | null }>,
+  referenceDate: Date = new Date()
+) {
+  return payments
+    .filter(
+      (payment) =>
+        payment.student_id === studentId &&
+        paymentIsInSchoolYear(payment, referenceDate)
+    )
+    .reduce((sum, payment) => sum + Number(payment.amount_paid ?? 0), 0);
+}
+
 function getInitials(name: string) {
   const parts = name.trim().split(/\s+/).filter(Boolean);
 
@@ -354,9 +424,7 @@ function Dashboard() {
         supabase
           .from("payments")
           .select("amount_paid, teacher_share")
-          .is("deleted_at", null)
-          .gte("payment_date", start)
-          .lt("payment_date", nextStart),
+          .is("deleted_at", null),
         supabase
           .from("expenses")
           .select("amount")
@@ -375,9 +443,10 @@ function Dashboard() {
 
       const studentsData = studentsResult.data ?? [];
       setStudentCount(studentsData.length);
+      const monthsDue = getCurrentSchoolYearMonthNumber(now);
       setExpectedIncome(
         studentsData.reduce(
-          (sum, student) => sum + Number(student.monthly_fee ?? 0),
+          (sum, student) => sum + Number(student.monthly_fee ?? 0) * monthsDue,
           0
         )
       );
@@ -391,12 +460,11 @@ function Dashboard() {
 
       if (!paymentsResult.error) {
         const paymentRows = paymentsResult.data ?? [];
-        setIncome(
-          paymentRows.reduce(
-            (sum, payment) => sum + Number(payment.amount_paid ?? 0),
-            0
-          )
+        const totalActualIncome = paymentRows.reduce(
+          (sum, payment) => sum + Number(payment.amount_paid ?? 0),
+          0
         );
+        setIncome(totalActualIncome);
         setTeacherShares(
           paymentRows.reduce(
             (sum, payment) => sum + Number(payment.teacher_share ?? 0),
@@ -1033,10 +1101,16 @@ function PaymentInvoiceModal({
   student,
   close,
   initialMonth,
+  initialPaymentId,
+  initialAction,
+  whatsAppWindow,
 }: {
   student: Student;
   close: () => void;
   initialMonth?: string;
+  initialPaymentId?: string | null;
+  initialAction?: "view" | "download" | "print" | "whatsapp";
+  whatsAppWindow?: Window | null;
 }) {
   const { lang } = useLanguage();
   const [month, setMonth] = useState(() => {
@@ -1055,19 +1129,30 @@ function PaymentInvoiceModal({
   const [editingOriginalAmount, setEditingOriginalAmount] = useState(0);
   const [editingCompensationType, setEditingCompensationType] = useState<"percentage" | "fixed_monthly_salary" | null>(null);
   const [editingCompensationPercentage, setEditingCompensationPercentage] = useState<number | null>(null);
+  const [isPartialPayment, setIsPartialPayment] = useState(false);
   const [payments, setPayments] = useState<
     { id: string; amount_paid: number; payment_date: string; teacher_id: string | null; compensation_type_snapshot: "percentage" | "fixed_monthly_salary" | null; compensation_percentage_snapshot: number | null }[]
   >([]);
   const [previousPaid, setPreviousPaid] = useState(0);
   const [loading, setLoading] = useState(false);
   const [loadingMonth, setLoadingMonth] = useState(false);
+  const [loadingInvoice, setLoadingInvoice] = useState(Boolean(initialPaymentId));
   const [error, setError] = useState("");
+  const [invoiceShareError, setInvoiceShareError] = useState("");
+  const [invoiceShareNotice, setInvoiceShareNotice] = useState("");
+  const [whatsAppInvoiceUrl, setWhatsAppInvoiceUrl] = useState<string | null>(null);
+  const [sharingInvoice, setSharingInvoice] = useState(false);
   const [deletePaymentId, setDeletePaymentId] = useState<string | null>(null);
   const [deleteReason, setDeleteReason] = useState("");
   const [receipt, setReceipt] = useState<{
     paymentDate: string;
+    paymentMonth: string;
+    dueAmount: number;
     amountThisPayment: number;
+    remainingAmount: number;
     totalPaid: number;
+    partialPayment: boolean;
+    statusLabel: string;
   } | null>(null);
   const [whatsAppDraft, setWhatsAppDraft] = useState<{
     type: WhatsAppMessageType;
@@ -1078,6 +1163,7 @@ function PaymentInvoiceModal({
     paymentDate?: string;
     month: string;
   } | null>(null);
+  const handledInitialAction = useRef(false);
 
   const loadMonthPayments = useCallback(async (selectedMonth: string) => {
     setLoadingMonth(true);
@@ -1123,6 +1209,48 @@ function PaymentInvoiceModal({
   }, [editingPaymentId, student.id, student.monthly_fee]);
 
   useEffect(() => {
+    if (initialPaymentId) {
+      const loadInvoicePayment = async () => {
+        const supabase = createClient();
+        const { data, error: fetchError } = await supabase
+          .from("payments")
+          .select("id, payment_month, payment_date, amount_paid")
+          .eq("id", initialPaymentId)
+          .is("deleted_at", null)
+          .maybeSingle();
+
+        if (fetchError || !data) {
+          console.error(fetchError ?? "Missing payment row for invoice.");
+          setError("تعذر تحميل الفاتورة المطلوبة.");
+          setLoadingInvoice(false);
+          whatsAppWindow?.close();
+          return;
+        }
+
+        const dueAmount = Number(student.monthly_fee ?? 0);
+        const amountPaidValue = Number(data.amount_paid ?? 0);
+        const paymentMonth = String(data.payment_month ?? initialMonth ?? month);
+        const paymentDateValue = String(data.payment_date ?? paymentDate);
+        setMonth(paymentMonth.slice(0, 7));
+        setAmountPaid(String(amountPaidValue));
+        setPaymentDate(paymentDateValue);
+        setReceipt({
+          paymentDate: paymentDateValue,
+          paymentMonth,
+          dueAmount,
+          amountThisPayment: amountPaidValue,
+          remainingAmount: Math.max(dueAmount - amountPaidValue, 0),
+          totalPaid: amountPaidValue,
+          partialPayment: amountPaidValue > 0 && amountPaidValue < dueAmount,
+          statusLabel: amountPaidValue >= dueAmount ? "Payé" : amountPaidValue > 0 ? "Paiement partiel" : "Non payé",
+        });
+        setLoadingInvoice(false);
+      };
+
+      void loadInvoicePayment();
+      return;
+    }
+
     const timer = window.setTimeout(() => {
       setEditingPaymentId(null);
       setEditingOriginalAmount(0);
@@ -1133,7 +1261,7 @@ function PaymentInvoiceModal({
     }, 0);
 
     return () => window.clearTimeout(timer);
-  }, [loadMonthPayments, month, student.id]);
+  }, [initialPaymentId, initialMonth, loadMonthPayments, month, paymentDate, student.id, student.monthly_fee, whatsAppWindow]);
 
   const monthlyFee = Number(student.monthly_fee ?? 0);
   const enteredAmount = Number(amountPaid || 0);
@@ -1208,6 +1336,8 @@ function PaymentInvoiceModal({
 
     const supabase = createClient();
     let saveError = null;
+    const dueAmountForThisPeriod = monthlyFee;
+    const nextRemainingAmount = isPartialPayment ? Math.max(dueAmountForThisPeriod - enteredAmount, 0) : 0;
 
     if (editingPaymentId) {
       const result = await supabase
@@ -1243,17 +1373,23 @@ function PaymentInvoiceModal({
       return;
     }
 
+    await loadMonthPayments(month);
     setReceipt({
       paymentDate,
+      paymentMonth: month,
+      dueAmount: dueAmountForThisPeriod,
       amountThisPayment: enteredAmount,
+      remainingAmount: nextRemainingAmount,
       totalPaid,
+      partialPayment: isPartialPayment,
+      statusLabel: isPartialPayment ? "Paiement partiel" : "Payé",
     });
     setLoading(false);
   }
 
-  function printInvoice() {
+  const printInvoice = useCallback(() => {
     window.print();
-  }
+  }, []);
 
   async function sendWhatsAppMessage() {
     if (!whatsAppDraft) return;
@@ -1321,18 +1457,15 @@ function PaymentInvoiceModal({
     });
   }
 
-  function sanitizeInvoiceFileName(value: string) {
+  const sanitizeInvoiceFileName = useCallback((value: string) => {
     return value
-      .normalize("NFD")
-      .replace(/[\u0300-\u036f]/g, "")
-      .replace(/[^a-zA-Z0-9\s-]/g, "")
       .trim()
-      .replace(/\s+/g, "-")
-      .replace(/-+/g, "-")
-      .toUpperCase();
-  }
+      .replace(/[<>:"/\\|?*\u0000-\u001f]/g, "")
+      .replace(/\s+/g, " ")
+      .replace(/[. ]+$/g, "");
+  }, []);
 
-  function buildInvoicePdfFileName(studentName: string, selectedMonth: string) {
+  const buildInvoicePdfFileName = useCallback((studentName: string, selectedMonth: string) => {
     const [year, monthNumber] = selectedMonth.split("-").map(Number);
     const monthLabel = new Date(Date.UTC(year, monthNumber - 1, 1)).toLocaleDateString("en-US", {
       month: "long",
@@ -1353,18 +1486,20 @@ function PaymentInvoiceModal({
     localStorage.setItem(storageKey, JSON.stringify(updatedNames.slice(-200)));
 
     return `${candidate}.pdf`;
-  }
+  }, [sanitizeInvoiceFileName]);
 
-  async function saveInvoicePdf() {
+  const saveInvoicePdf = useCallback(async () => {
     const invoiceNode = document.querySelector(".print-invoice") as HTMLElement | null;
 
     if (!invoiceNode) {
       console.error("Invoice element not found for PDF export.");
-      return;
+      setInvoiceShareError("تعذر العثور على الفاتورة لإنشاء ملف PDF.");
+      return false;
     }
 
+    let clone: HTMLElement | null = null;
     try {
-      const clone = invoiceNode.cloneNode(true) as HTMLElement;
+      clone = invoiceNode.cloneNode(true) as HTMLElement;
       clone.style.position = "fixed";
       clone.style.left = "-9999px";
       clone.style.top = "0";
@@ -1409,8 +1544,6 @@ function PaymentInvoiceModal({
         height: 210 * 3.78,
       });
 
-      clone.remove();
-
       const pdf = new jsPDF({
         orientation: "portrait",
         unit: "mm",
@@ -1429,21 +1562,139 @@ function PaymentInvoiceModal({
 
       pdf.addImage(imgData, "PNG", x, y, imgWidth, imgHeight, undefined, "FAST");
       pdf.save(buildInvoicePdfFileName(student.full_name, month));
+      return true;
     } catch (error) {
       console.error("Failed to generate invoice PDF:", error);
-      setError("تعذر إنشاء ملف PDF للفاتورة. يرجى المحاولة مرة أخرى.");
+      setInvoiceShareError("تعذر إنشاء ملف PDF للفاتورة. يرجى المحاولة مرة أخرى.");
+      return false;
+    } finally {
+      clone?.remove();
     }
-  }
+  }, [buildInvoicePdfFileName, month, student.full_name]);
+
+  const shareInvoiceViaWhatsApp = useCallback(async (existingWindow?: Window | null) => {
+    setInvoiceShareError("");
+    setInvoiceShareNotice("");
+    setWhatsAppInvoiceUrl(null);
+
+    const rawPhone = student.guardian_phone || student.phone;
+    const normalizedPhone = normalizeMoroccanMobileNumber(rawPhone);
+    if (!normalizedPhone) {
+      existingWindow?.close();
+      setInvoiceShareError(
+        lang === "ar"
+          ? rawPhone
+            ? "رقم هاتف ولي الأمر غير صالح. أدخل رقم هاتف محمول مغربي يبدأ بـ 06 أو 07."
+            : "رقم هاتف ولي الأمر غير متوفر."
+          : rawPhone
+            ? "Le numéro du parent est invalide. Saisissez un mobile marocain commençant par 06 ou 07."
+            : "Le numéro de téléphone du parent est manquant."
+      );
+      return;
+    }
+
+    const invoiceMonth = (receipt?.paymentMonth || month).slice(0, 7);
+    const invoiceAmounts = receipt
+      ? [receipt.dueAmount, receipt.totalPaid, receipt.remainingAmount]
+      : [];
+    if (
+      !receipt ||
+      !student.full_name.trim() ||
+      !/^\d{4}-(0[1-9]|1[0-2])$/.test(invoiceMonth) ||
+      student.monthly_fee == null ||
+      !invoiceAmounts.every((amount) => Number.isFinite(amount) && amount >= 0)
+    ) {
+      existingWindow?.close();
+      setInvoiceShareError(
+        lang === "ar"
+          ? "بيانات الفاتورة غير مكتملة. تحقق من اسم التلميذ والشهر والمبالغ."
+          : "Les données de la facture sont incomplètes. Vérifiez le nom, le mois et les montants."
+      );
+      return;
+    }
+
+    const message = buildInvoiceWhatsAppMessage({
+      studentName: student.full_name.trim(),
+      month: invoiceMonth,
+      totalAmount: receipt.dueAmount,
+      paidAmount: receipt.totalPaid,
+      balance: receipt.remainingAmount,
+      lang,
+    });
+    const whatsAppUrl = buildWhatsAppWebUrl(normalizedPhone, message);
+    if (!whatsAppUrl) {
+      existingWindow?.close();
+      setInvoiceShareError(
+        lang === "ar" ? "تعذر إعداد رابط واتساب." : "Impossible de préparer le lien WhatsApp."
+      );
+      return;
+    }
+
+    const whatsAppPopup = existingWindow ?? window.open("about:blank", "_blank");
+    setSharingInvoice(true);
+    try {
+      const pdfGenerated = await saveInvoicePdf();
+      if (!pdfGenerated) {
+        whatsAppPopup?.close();
+        return;
+      }
+
+      setWhatsAppInvoiceUrl(whatsAppUrl);
+      setInvoiceShareNotice(
+        lang === "ar"
+          ? "تم تنزيل الفاتورة. أرفق ملف PDF يدوياً في واتساب قبل الضغط على إرسال."
+          : "La facture a été téléchargée. Joignez le PDF manuellement dans WhatsApp avant d'envoyer."
+      );
+
+      if (whatsAppPopup) {
+        whatsAppPopup.opener = null;
+        whatsAppPopup.location.href = whatsAppUrl;
+      } else {
+        setInvoiceShareError(
+          lang === "ar"
+            ? "تم تنزيل الفاتورة، لكن المتصفح منع فتح واتساب تلقائياً. استخدم الرابط أدناه."
+            : "La facture a été téléchargée, mais le navigateur a bloqué WhatsApp. Utilisez le lien ci-dessous."
+        );
+      }
+    } catch (error) {
+      console.error("Failed to open WhatsApp invoice composer:", error);
+      setInvoiceShareError(
+        lang === "ar"
+          ? "تم إنشاء الفاتورة، لكن تعذر فتح واتساب. استخدم الرابط أدناه."
+          : "La facture a été créée, mais WhatsApp n'a pas pu s'ouvrir. Utilisez le lien ci-dessous."
+      );
+    } finally {
+      setSharingInvoice(false);
+    }
+  }, [lang, month, receipt, saveInvoicePdf, student.full_name, student.guardian_phone, student.monthly_fee, student.phone]);
+
+  useEffect(() => {
+    if (!initialPaymentId || !receipt || !initialAction || handledInitialAction.current) return;
+    const timer = window.setTimeout(() => {
+      handledInitialAction.current = true;
+
+      if (initialAction === "download") {
+        void saveInvoicePdf();
+      } else if (initialAction === "print") {
+        printInvoice();
+      } else if (initialAction === "whatsapp") {
+        void shareInvoiceViaWhatsApp(whatsAppWindow);
+      }
+    }, 0);
+
+    return () => window.clearTimeout(timer);
+  }, [initialAction, initialPaymentId, printInvoice, receipt, saveInvoicePdf, shareInvoiceViaWhatsApp, whatsAppWindow]);
 
   if (receipt) {
-    const monthLabel = new Date(`${month}-01T00:00:00Z`).toLocaleDateString(
-      lang === "ar" ? "ar-MA" : "fr-FR",
+    const receiptMonth = (receipt.paymentMonth || month).slice(0, 7);
+    const monthLabel = new Date(`${receiptMonth}-01T00:00:00Z`).toLocaleDateString(
+      "ar-MA",
       { month: "long", year: "numeric", timeZone: "UTC" }
     );
 
     return (
       <div className="modal-layer invoice-layer" onMouseDown={close}>
-        <div className="invoice-modal" onMouseDown={(e) => e.stopPropagation()}>
+        <div className="invoice-modal" dir="rtl" onMouseDown={(e) => e.stopPropagation()}>
           <style jsx global>{`
             .invoice-layer { z-index: 1000; }
             .invoice-modal { width: min(760px, calc(100vw - 32px)); max-height: 92vh; overflow: auto; background: #fff; border-radius: 18px; padding: 20px; box-shadow: 0 20px 60px rgba(15, 23, 42, 0.18); }
@@ -1611,9 +1862,9 @@ function PaymentInvoiceModal({
               </div>
             </div>
 
-            <div className="invoice-number-row">
-              <span>تاريخ الأداء: <strong>{formatDate(receipt.paymentDate, lang)}</strong></span>
-              <span>الشهر: <strong>{monthLabel}</strong></span>
+            <div className="invoice-number-row" dir="rtl">
+              <span>تاريخ الأداء: <strong>{formatDate(receipt.paymentDate, "ar")}</strong></span>
+              <span>الشهر المؤدى عنه: <strong>{monthLabel}</strong></span>
             </div>
 
             <div className="invoice-student">
@@ -1631,30 +1882,42 @@ function PaymentInvoiceModal({
               </thead>
               <tbody>
                 <tr>
-                  <td>الثمن الشهري</td>
-                  <td>{monthlyFee.toLocaleString("fr-FR")} د.م</td>
+                  <td>الشهر المؤدى عنه</td>
+                  <td>{monthLabel}</td>
                 </tr>
-                <tr>
-                  <td>الأداء السابق لهذا الشهر</td>
-                  <td>{previousPaid.toLocaleString("fr-FR")} د.م</td>
-                </tr>
+                {receipt.partialPayment && (
+                  <tr>
+                    <td>المبلغ المستحق</td>
+                    <td>{receipt.dueAmount.toLocaleString("fr-FR")} د.م</td>
+                  </tr>
+                )}
                 <tr className="invoice-paid">
-                  <td>الأداء الحالي</td>
+                  <td>المبلغ المؤدى</td>
                   <td>{receipt.amountThisPayment.toLocaleString("fr-FR")} د.م</td>
                 </tr>
-                <tr className="invoice-total">
-                  <td>المجموع المؤدى</td>
-                  <td>{receipt.totalPaid.toLocaleString("fr-FR")} د.م</td>
-                </tr>
-                <tr className="invoice-remaining">
-                  <td>الباقي</td>
-                  <td>{Math.max(monthlyFee - receipt.totalPaid, 0).toLocaleString("fr-FR")} د.م</td>
-                </tr>
+                {receipt.partialPayment && (
+                  <tr className="invoice-remaining">
+                    <td>المبلغ المتبقي</td>
+                    <td>{receipt.remainingAmount.toLocaleString("fr-FR")} د.م</td>
+                  </tr>
+                )}
+                {!receipt.partialPayment && (
+                  <tr className="invoice-total">
+                    <td>المجموع المؤدى</td>
+                    <td>{receipt.totalPaid.toLocaleString("fr-FR")} د.م</td>
+                  </tr>
+                )}
+                {receipt.partialPayment && (
+                  <tr className="invoice-total">
+                    <td>مجموع المبلغ المؤدى</td>
+                    <td>{receipt.totalPaid.toLocaleString("fr-FR")} د.م</td>
+                  </tr>
+                )}
               </tbody>
             </table>
 
             <div className="invoice-status">
-              {receipt.totalPaid >= monthlyFee ? "الأداء مكتمل ✓" : "أداء جزئي"}
+              {receipt.partialPayment ? "أداء جزئي" : "مؤدى"}
             </div>
 
             <div className="invoice-footer">
@@ -1663,10 +1926,28 @@ function PaymentInvoiceModal({
             </div>
 
             <div className="invoice-actions no-print" style={{ marginTop: 18, justifyContent: "flex-start" }}>
+              <button
+                type="button"
+                className="primary"
+                onClick={() => void shareInvoiceViaWhatsApp()}
+                disabled={sharingInvoice}
+              >
+                {sharingInvoice ? "جارٍ إعداد الفاتورة..." : "إرسال الفاتورة عبر WhatsApp"}
+              </button>
               <button type="button" className="secondary" onClick={() => openWhatsAppComposer("payment_confirmation")}>
                 إرسال عبر واتساب
               </button>
             </div>
+
+            {invoiceShareNotice && <p className="no-print" style={{ color: "#0f7f68" }}>{invoiceShareNotice}</p>}
+            {invoiceShareError && <p className="no-print form-error">{invoiceShareError}</p>}
+            {whatsAppInvoiceUrl && (
+              <p className="no-print">
+                <a href={whatsAppInvoiceUrl} target="_blank" rel="noreferrer" className="secondary small">
+                  فتح WhatsApp Web
+                </a>
+              </p>
+            )}
 
             {whatsAppDraft && (
               <div className="no-print" style={{ marginTop: 16, padding: 16, border: "1px solid #dfe7ee", borderRadius: 12, background: "#f8fafc" }}>
@@ -1692,9 +1973,30 @@ function PaymentInvoiceModal({
     );
   }
 
+  if (initialPaymentId) {
+    return (
+      <div className="modal-layer invoice-layer" dir="rtl" onMouseDown={close}>
+        <div className="invoice-modal" onMouseDown={(event) => event.stopPropagation()}>
+          <div className="modal-head">
+            <div>
+              <h2>الفاتورة المحفوظة</h2>
+              <p>{student.full_name}</p>
+            </div>
+            <button type="button" className="close" onClick={close}>×</button>
+          </div>
+          {loadingInvoice ? (
+            <div className="empty"><h2>جارٍ تحميل الفاتورة...</h2></div>
+          ) : (
+            <p className="form-error">{error || "تعذر تحميل الفاتورة المطلوبة."}</p>
+          )}
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="modal-layer" onMouseDown={close}>
-      <form className="student-modal payment-modal" onMouseDown={(e) => e.stopPropagation()} onSubmit={handlePayment}>
+      <form className="student-modal payment-modal" dir="rtl" onMouseDown={(e) => e.stopPropagation()} onSubmit={handlePayment}>
         <div className="modal-head">
           <div>
             <h2>تسجيل الأداء وطباعة الفاتورة</h2>
@@ -1719,6 +2021,7 @@ function PaymentInvoiceModal({
                     setEditingCompensationType(payment.compensation_type_snapshot);
                     setEditingCompensationPercentage(payment.compensation_percentage_snapshot);
                     setAmountPaid(String(payment.amount_paid));
+                    setIsPartialPayment(Number(payment.amount_paid) > 0 && Number(payment.amount_paid) < Number(student.monthly_fee ?? 0));
                     setPaymentDate(payment.payment_date);
                     setDeletePaymentId(null);
                     setDeleteReason("");
@@ -1765,7 +2068,12 @@ function PaymentInvoiceModal({
 
         <div className="form-grid">
           <label>
-            الشهر المؤدى عنه <span className="required">*</span>
+            اسم التلميذ
+            <input value={student.full_name} readOnly aria-readonly="true" />
+          </label>
+
+          <label>
+            الشهر الدراسي المؤدى عنه <span className="required">*</span>
             <input type="month" value={month} onChange={(e) => setMonth(e.target.value)} required />
           </label>
 
@@ -1780,7 +2088,7 @@ function PaymentInvoiceModal({
           </label>
 
           <label>
-            المبلغ المؤدى (د.م) <span className="required">*</span>
+            المبلغ المؤدى بالدرهم <span className="required">*</span>
             <input
               type="number"
               min="0.01"
@@ -1791,6 +2099,20 @@ function PaymentInvoiceModal({
               required
             />
           </label>
+        </div>
+
+        <div style={{ marginBottom: 16, padding: 14, borderRadius: 12, background: "#f7f8fa", border: "1px solid #e7ebef" }}>
+          <div style={{ display: "block", marginBottom: 8, fontWeight: 700 }}>هل الأداء جزئي؟</div>
+          <div style={{ display: "flex", gap: 18, flexWrap: "wrap" }}>
+            <label style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
+              <input type="radio" name="partial-payment" checked={isPartialPayment === true} onChange={() => setIsPartialPayment(true)} />
+              نعم
+            </label>
+            <label style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
+              <input type="radio" name="partial-payment" checked={isPartialPayment === false} onChange={() => setIsPartialPayment(false)} />
+              لا
+            </label>
+          </div>
         </div>
 
         <div className="payment-summary">
@@ -1809,6 +2131,7 @@ function PaymentInvoiceModal({
               setEditingOriginalAmount(0);
               setEditingCompensationType(null);
               setEditingCompensationPercentage(null);
+              setIsPartialPayment(false);
               setAmountPaid(student.monthly_fee != null ? String(student.monthly_fee) : "");
               const now = new Date();
               setPaymentDate(`${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`);
@@ -1831,6 +2154,161 @@ function PaymentInvoiceModal({
         </div>
       </form>
     </div>
+  );
+}
+
+function StudentPaymentHistoryModal({
+  student,
+  close,
+}: {
+  student: Student;
+  close: () => void;
+}) {
+  const { lang } = useLanguage();
+  const [rows, setRows] = useState<Array<{
+    id: string;
+    payment_month: string;
+    payment_date: string | null;
+    amount_due: number;
+    amount_paid: number;
+    remaining: number;
+    status: string;
+  }>>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [selectedInvoicePaymentId, setSelectedInvoicePaymentId] = useState<string | null>(null);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      void (async () => {
+        const supabase = createClient();
+        const { data, error: fetchError } = await supabase
+          .from("payments")
+          .select("id, payment_month, payment_date, amount_paid")
+          .eq("student_id", student.id)
+          .is("deleted_at", null)
+          .order("payment_date", { ascending: true });
+
+        if (fetchError) {
+          setError("تعذر تحميل سجل الأداءات.");
+          setRows([]);
+          setLoading(false);
+          return;
+        }
+
+        const duePerMonth = Number(student.monthly_fee ?? 0);
+        const nextRows = (data ?? []).map((row) => {
+          const paid = Number(row.amount_paid ?? 0);
+          const status = paid >= duePerMonth ? "Payé" : paid > 0 ? "Partiel" : "Non payé";
+          const remaining = Math.max(duePerMonth - paid, 0);
+          return {
+            id: String(row.id),
+            payment_month: String(row.payment_month ?? ""),
+            payment_date: String(row.payment_date ?? "—"),
+            amount_due: duePerMonth,
+            amount_paid: paid,
+            remaining,
+            status,
+          };
+        });
+
+        setRows(nextRows);
+        setLoading(false);
+      })();
+    }, 0);
+
+    return () => window.clearTimeout(timer);
+  }, [student.id, student.monthly_fee]);
+
+  const totalPaid = rows.reduce((sum, row) => sum + row.amount_paid, 0);
+  const totalRemaining = rows.reduce((sum, row) => sum + row.remaining, 0);
+
+  const statusFromTotal =
+    totalPaid <= 0 ? "Non payé" : totalPaid >= Number(student.monthly_fee ?? 0) * getCurrentSchoolYearMonthNumber(new Date()) ? "Payé" : "Partiel";
+
+  return (
+    <>
+      <div className="modal-layer" onMouseDown={close}>
+        <div className="student-modal" onMouseDown={(e) => e.stopPropagation()} style={{ width: 1080, maxWidth: "calc(100vw - 32px)" }}>
+          <div className="modal-head">
+            <div>
+              <h2>سجل الأداءات</h2>
+              <p>{student.full_name}</p>
+            </div>
+            <button type="button" className="close" onClick={close}>×</button>
+          </div>
+
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(190px, 1fr))", gap: 12, marginBottom: 18 }}>
+            <div style={{ background: "#f7f8fa", borderRadius: 10, padding: 12 }}><small style={{ color: "#788292", display: "block", marginBottom: 4 }}>الاسم</small><strong>{student.full_name}</strong></div>
+            <div style={{ background: "#f7f8fa", borderRadius: 10, padding: 12 }}><small style={{ color: "#788292", display: "block", marginBottom: 4 }}>المستوى</small><strong>{codeToLevel[student.level_code] ?? student.level_code}</strong></div>
+            <div style={{ background: "#f7f8fa", borderRadius: 10, padding: 12 }}><small style={{ color: "#788292", display: "block", marginBottom: 4 }}>تاريخ التسجيل</small><strong>{formatDate(student.registration_date, lang)}</strong></div>
+            <div style={{ background: "#f7f8fa", borderRadius: 10, padding: 12 }}><small style={{ color: "#788292", display: "block", marginBottom: 4 }}>الشهرية</small><strong>{Number(student.monthly_fee ?? 0).toLocaleString("fr-FR")} د.م</strong></div>
+            <div style={{ background: "#f7f8fa", borderRadius: 10, padding: 12 }}><small style={{ color: "#788292", display: "block", marginBottom: 4 }}>الحالة الحالية</small><strong>{statusFromTotal}</strong></div>
+            <div style={{ background: "#f7f8fa", borderRadius: 10, padding: 12 }}><small style={{ color: "#788292", display: "block", marginBottom: 4 }}>Reste actuel</small><strong>{Math.max(Number(student.monthly_fee ?? 0) * getCurrentSchoolYearMonthNumber(new Date()) - totalPaid, 0).toLocaleString("fr-FR")} د.م</strong></div>
+          </div>
+
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 12, marginBottom: 18 }}>
+            <div style={{ background: "#eef8f4", borderRadius: 10, padding: 12 }}><small style={{ color: "#788292", display: "block", marginBottom: 4 }}>Total paid</small><strong>{totalPaid.toLocaleString("fr-FR")} د.م</strong></div>
+            <div style={{ background: "#fff8e8", borderRadius: 10, padding: 12 }}><small style={{ color: "#788292", display: "block", marginBottom: 4 }}>Total remaining</small><strong>{totalRemaining.toLocaleString("fr-FR")} د.م</strong></div>
+          </div>
+
+          {loading ? (
+            <div className="empty"><h2>جاري تحميل سجل الأداءات...</h2></div>
+          ) : error ? (
+            <p className="form-error">{error}</p>
+          ) : rows.length === 0 ? (
+            <div className="empty"><h2>لا توجد أداءات مسجلة لهذا التلميذ.</h2></div>
+          ) : (
+            <div className="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>الشهر</th>
+                    <th>تاريخ الأداء</th>
+                    <th>المبلغ الواجب</th>
+                    <th>المبلغ المؤدى</th>
+                    <th>الباقي</th>
+                    <th>الحالة</th>
+                    <th>الفاتورة</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {rows.map((row) => (
+                    <tr key={row.id}>
+                      <td>{row.payment_month ? new Date(`${row.payment_month}-01T00:00:00Z`).toLocaleDateString(lang === "ar" ? "ar-MA" : "fr-FR", { month: "long", year: "numeric", timeZone: "UTC" }) : "—"}</td>
+                      <td>{row.payment_date && row.payment_date !== "—" ? formatDate(row.payment_date, lang) : "—"}</td>
+                      <td>{row.amount_due.toLocaleString("fr-FR")} د.م</td>
+                      <td>{row.amount_paid.toLocaleString("fr-FR")} د.م</td>
+                      <td>{row.remaining.toLocaleString("fr-FR")} د.م</td>
+                      <td><span className="payment">{row.status}</span></td>
+                      <td>
+                        {row.amount_paid > 0 ? (
+                          <button type="button" className="secondary small" onClick={() => setSelectedInvoicePaymentId(row.id)}>
+                            Voir facture
+                          </button>
+                        ) : "—"}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          <div className="modal-actions">
+            <button type="button" className="secondary" onClick={close}>إغلاق</button>
+          </div>
+        </div>
+      </div>
+
+      {selectedInvoicePaymentId && (
+        <PaymentInvoiceModal
+          student={student}
+          close={() => setSelectedInvoicePaymentId(null)}
+          initialPaymentId={selectedInvoicePaymentId}
+        />
+      )}
+    </>
   );
 }
 
@@ -1891,6 +2369,7 @@ function Students() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
 
+  const [paymentHistoryStudent, setPaymentHistoryStudent] = useState<Student | null>(null);
   const [open, setOpen] = useState(false);
   const [editingStudent, setEditingStudent] = useState<Student | null>(null);
   const [q, setQ] = useState("");
@@ -2292,6 +2771,13 @@ function Students() {
 
                             <button
                               type="button"
+                              onClick={() => setPaymentHistoryStudent(student)}
+                            >
+                              سجل الأداءات
+                            </button>
+
+                            <button
+                              type="button"
                               onClick={() => setHistoryStudent(student)}
                             >
                               الحضور
@@ -2372,6 +2858,13 @@ function Students() {
         />
       )}
 
+      {paymentHistoryStudent && (
+        <StudentPaymentHistoryModal
+          student={paymentHistoryStudent}
+          close={() => setPaymentHistoryStudent(null)}
+        />
+      )}
+
       {historyStudent && (
         <StudentAttendanceHistory
           student={historyStudent}
@@ -2403,17 +2896,24 @@ function Students() {
 
 
 function Payments() {
-  const { lang } = useLanguage();
   const [students, setStudents] = useState<Student[]>([]);
   const [payments, setPayments] = useState<
     { id: string; student_id: string; payment_month: string; amount_paid: number; payment_date: string }[]
   >([]);
   const [year, setYear] = useState(new Date().getFullYear());
+  const [historyMonthNumber, setHistoryMonthNumber] = useState(new Date().getMonth() + 1);
   const [search, setSearch] = useState("");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [invoiceStudent, setInvoiceStudent] = useState<Student | null>(null);
   const [invoiceMonth, setInvoiceMonth] = useState<string | undefined>(undefined);
+  const [expandedPaymentHistoryStudentId, setExpandedPaymentHistoryStudentId] = useState<string | null>(null);
+  const [historyInvoice, setHistoryInvoice] = useState<{
+    student: Student;
+    paymentId: string;
+    action: "view" | "download" | "print" | "whatsapp";
+    whatsAppWindow: Window | null;
+  } | null>(null);
 
   async function loadPaymentsPage() {
     setLoading(true);
@@ -2424,7 +2924,6 @@ function Payments() {
       supabase
         .from("students")
         .select("*")
-        .eq("is_active", true)
         .order("full_name"),
       supabase
         .from("payments")
@@ -2469,10 +2968,10 @@ function Payments() {
   const months = Array.from({ length: 12 }, (_, i) => i + 1);
 
   const monthNames = months.map((m) =>
-    new Date(Date.UTC(year, m - 1, 1)).toLocaleDateString(
-      lang === "ar" ? "ar-MA" : "fr-FR",
-      { month: "short", timeZone: "UTC" }
-    )
+    new Date(Date.UTC(year, m - 1, 1)).toLocaleDateString("ar-MA", {
+      month: "short",
+      timeZone: "UTC",
+    })
   );
 
   function monthData(student: Student, monthNumber: number) {
@@ -2501,17 +3000,38 @@ function Payments() {
     };
   }
 
-  const filteredStudents = students.filter((student) =>
-    matchesStudentSearch(student, search)
+  const filteredStudents = students.filter(
+    (student) => student.is_active && matchesStudentSearch(student, search)
   );
+  const selectedHistoryMonth = `${year}-${String(historyMonthNumber).padStart(2, "0")}`;
+  const historyPayments = payments.filter((payment) =>
+    payment.payment_month.startsWith(selectedHistoryMonth)
+  );
+  const studentsById = new Map(students.map((student) => [student.id, student]));
+
+  function openHistoricalInvoice(
+    student: Student | undefined,
+    paymentId: string,
+    action: "view" | "download" | "print" | "whatsapp"
+  ) {
+    if (!student) return;
+    const whatsAppWindow = action === "whatsapp" ? window.open("about:blank", "_blank") : null;
+    setHistoryInvoice({ student, paymentId, action, whatsAppWindow });
+  }
+
+  function getStudentRecordedPayments(studentId: string) {
+    return payments
+      .filter((payment) => payment.student_id === studentId)
+      .sort((first, second) => {
+        const dateOrder = second.payment_date.localeCompare(first.payment_date);
+        return dateOrder || second.payment_month.localeCompare(first.payment_month);
+      });
+  }
 
   const getStudentPaymentSnapshot = (student: Student) => {
     const monthlyFee = Number(student.monthly_fee ?? 0);
-    const totalPaid = months.reduce(
-      (sum, monthNumber) => sum + monthData(student, monthNumber).paid,
-      0
-    );
-    const totalExpected = monthlyFee * months.length;
+    const totalPaid = getStudentSchoolYearPaidTotal(student.id, payments);
+    const totalExpected = monthlyFee * getCurrentSchoolYearMonthNumber(new Date());
     const remaining = Math.max(totalExpected - totalPaid, 0);
     const status =
       totalPaid <= 0
@@ -2523,24 +3043,18 @@ function Payments() {
     return { monthlyFee, totalPaid, totalExpected, remaining, status };
   };
 
-  const totalExpected = filteredStudents.reduce(
-    (sum, student) => sum + Number(student.monthly_fee ?? 0) * months.length,
-    0
-  );
+  const totalExpected = filteredStudents.reduce((sum, student) => {
+    const monthlyFee = Number(student.monthly_fee ?? 0);
+    return sum + monthlyFee * getCurrentSchoolYearMonthNumber(new Date());
+  }, 0);
 
   const totalCollected = filteredStudents.reduce(
-    (sum, student) =>
-      sum +
-      months.reduce(
-        (monthSum, monthNumber) =>
-          monthSum + monthData(student, monthNumber).paid,
-        0
-      ),
+    (sum, student) => sum + getStudentSchoolYearPaidTotal(student.id, payments),
     0
   );
 
   return (
-    <>
+    <div dir="rtl">
       <section className="welcome sub">
         <div>
           <p>الرئيسية ← الأداءات</p>
@@ -2555,17 +3069,17 @@ function Payments() {
         <div
           style={{
             display: "grid",
-            gridTemplateColumns: "minmax(0, 1fr) 180px 180px",
+            gridTemplateColumns: "minmax(0, 1fr) 180px 180px 180px",
             gap: 12,
             alignItems: "end",
           }}
         >
           <label>
-            Rechercher un élève
+            البحث عن تلميذ
             <input
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              placeholder="Rechercher un élève..."
+              placeholder="ابحث عن تلميذ..."
               style={{ width: "100%", marginTop: 7 }}
             />
           </label>
@@ -2580,6 +3094,21 @@ function Payments() {
               {[year - 2, year - 1, year, year + 1].map((y) => (
                 <option key={y} value={y}>
                   {y}
+                </option>
+              ))}
+            </select>
+          </label>
+
+          <label>
+            الشهر
+            <select
+              value={historyMonthNumber}
+              onChange={(e) => setHistoryMonthNumber(Number(e.target.value))}
+              style={{ width: "100%", marginTop: 7 }}
+            >
+              {months.map((monthNumber, index) => (
+                <option key={monthNumber} value={monthNumber}>
+                  {monthNames[index]}
                 </option>
               ))}
             </select>
@@ -2611,7 +3140,7 @@ function Payments() {
                 background: "#fafbfc",
               }}
             >
-              Aucun élève trouvé
+              لم يتم العثور على تلميذ.
             </div>
           ) : (
             <div
@@ -2623,6 +3152,7 @@ function Payments() {
             >
               {filteredStudents.map((student) => {
                 const summary = getStudentPaymentSnapshot(student);
+                const studentRecordedPayments = getStudentRecordedPayments(student.id);
                 const studentLevel =
                   codeToLevel[student.level_code] ?? student.level_code ?? "—";
 
@@ -2679,20 +3209,24 @@ function Payments() {
                               : "#c85c5a",
                         }}
                       >
-                        {summary.status}
+                        {summary.status === "Payé"
+                          ? "مؤدى"
+                          : summary.status === "Partiel"
+                            ? "جزئي"
+                            : "غير مؤدى"}
                       </span>
                     </div>
 
                     <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
                       <div style={{ background: "#f7f8fa", borderRadius: 10, padding: "10px 12px" }}>
                         <small style={{ color: "#788292", display: "block", marginBottom: 4 }}>
-                          Téléphone
+                        الهاتف
                         </small>
                         <strong>{student.phone || "—"}</strong>
                       </div>
                       <div style={{ background: "#f7f8fa", borderRadius: 10, padding: "10px 12px" }}>
                         <small style={{ color: "#788292", display: "block", marginBottom: 4 }}>
-                          Niveau
+                          المستوى
                         </small>
                         <strong>{studentLevel}</strong>
                       </div>
@@ -2701,13 +3235,13 @@ function Payments() {
                     <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
                       <div>
                         <small style={{ color: "#788292", display: "block", marginBottom: 4 }}>
-                          Déjà payé
+                          المؤدى
                         </small>
                         <strong>{summary.totalPaid.toLocaleString("fr-FR")} د.م</strong>
                       </div>
                       <div>
                         <small style={{ color: "#788292", display: "block", marginBottom: 4 }}>
-                          Reste
+                          الباقي
                         </small>
                         <strong>{summary.remaining.toLocaleString("fr-FR")} د.م</strong>
                       </div>
@@ -2730,8 +3264,84 @@ function Payments() {
                         gap: 8,
                       }}
                     >
-                      💰 Enregistrer paiement
+                      💰 تسجيل الأداء
                     </button>
+
+                    <button
+                      type="button"
+                      className="secondary"
+                      aria-expanded={expandedPaymentHistoryStudentId === student.id}
+                      onClick={() => setExpandedPaymentHistoryStudentId(
+                        expandedPaymentHistoryStudentId === student.id ? null : student.id
+                      )}
+                      style={{ width: "100%" }}
+                    >
+                      سجل الأداءات والفواتير
+                    </button>
+
+                    {expandedPaymentHistoryStudentId === student.id && (
+                      <div
+                        style={{
+                          width: "100%",
+                          boxSizing: "border-box",
+                          padding: 12,
+                          border: "1px solid #e7ebef",
+                          borderRadius: 10,
+                          background: "#f8fafc",
+                        }}
+                      >
+                        <strong style={{ display: "block", marginBottom: 10 }}>
+                          سجل الأداءات المسجلة
+                        </strong>
+                        {studentRecordedPayments.length === 0 ? (
+                          <p style={{ margin: 0, color: "#788292" }}>
+                            لا توجد أداءات مسجلة لهذا التلميذ.
+                          </p>
+                        ) : (
+                          <div style={{ display: "grid", gap: 10 }}>
+                            {studentRecordedPayments.map((payment) => {
+                              const paidMonthKey = payment.payment_month.slice(0, 7);
+                              const paidMonthLabel = /^\d{4}-(0[1-9]|1[0-2])$/.test(paidMonthKey)
+                                ? new Date(`${paidMonthKey}-01T00:00:00Z`).toLocaleDateString(
+                                    "ar-MA",
+                                    { month: "long", year: "numeric", timeZone: "UTC" }
+                                  )
+                                : "—";
+
+                              return (
+                                <div
+                                  key={payment.id}
+                                  style={{
+                                    display: "grid",
+                                    gap: 6,
+                                    padding: 10,
+                                    borderRadius: 8,
+                                    background: "#fff",
+                                  }}
+                                >
+                                  <strong>{paidMonthLabel}</strong>
+                                  <span>
+                                    تاريخ الأداء: {payment.payment_date
+                                      ? formatDate(payment.payment_date, "ar")
+                                      : "غير متوفر"}
+                                  </span>
+                                  <span>
+                                    المبلغ المؤدى: {payment.amount_paid.toLocaleString("fr-FR")} درهم
+                                  </span>
+                                  <button
+                                    type="button"
+                                    className="secondary small"
+                                    onClick={() => openHistoricalInvoice(student, payment.id, "download")}
+                                  >
+                                    تحميل الفاتورة PDF
+                                  </button>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        )}
+                      </div>
+                    )}
                   </div>
                 );
               })}
@@ -2970,6 +3580,88 @@ function Payments() {
               </table>
             </div>
           </section>
+
+          <section className="students-card" style={{ marginTop: 18, overflow: "hidden" }} dir="rtl">
+            <div style={{ padding: "16px 18px", borderBottom: "1px solid #e7ebef" }}>
+              <strong style={{ fontSize: 18 }}>سجل الأداءات الشهرية</strong>
+              <p style={{ margin: "6px 0 0", color: "#788292", fontSize: 13 }}>
+                سجل الأداءات المسجلة لشهر {monthNames[historyMonthNumber - 1]} {year}. عرض الفاتورة أو تحميلها أو طباعتها لا يسجل أداءً جديداً.
+              </p>
+            </div>
+            {historyPayments.length === 0 ? (
+              <div className="empty"><h2>لا توجد أداءات مسجلة لهذا الشهر.</h2></div>
+            ) : (
+              <div className="table-wrap" style={{ overflowX: "auto" }}>
+                <table style={{ minWidth: 900 }}>
+                  <thead>
+                    <tr>
+                      <th>اسم التلميذ</th>
+                      <th>تاريخ الأداء</th>
+                      <th>الشهر المؤدى عنه</th>
+                      <th>المبلغ المؤدى</th>
+                      <th>إجراءات الفاتورة</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {historyPayments.map((payment) => {
+                      const student = studentsById.get(payment.student_id);
+                      const paymentMonthLabel = payment.payment_month
+                        ? new Date(`${payment.payment_month.slice(0, 7)}-01T00:00:00Z`).toLocaleDateString(
+                            "ar-MA",
+                            { month: "long", year: "numeric", timeZone: "UTC" }
+                          )
+                        : "—";
+
+                      return (
+                        <tr key={payment.id}>
+                          <td>{student?.full_name ?? "التلميذ غير متوفر"}</td>
+                          <td>{payment.payment_date ? formatDate(payment.payment_date, "ar") : "—"}</td>
+                          <td>{paymentMonthLabel}</td>
+                          <td>{payment.amount_paid.toLocaleString("fr-FR")} د.م</td>
+                          <td>
+                            <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                              <button
+                                type="button"
+                                className="secondary small"
+                                disabled={!student}
+                                onClick={() => openHistoricalInvoice(student, payment.id, "view")}
+                              >
+                                عرض الفاتورة
+                              </button>
+                              <button
+                                type="button"
+                                className="secondary small"
+                                disabled={!student}
+                                onClick={() => openHistoricalInvoice(student, payment.id, "download")}
+                              >
+                                تحميل PDF
+                              </button>
+                              <button
+                                type="button"
+                                className="secondary small"
+                                disabled={!student}
+                                onClick={() => openHistoricalInvoice(student, payment.id, "print")}
+                              >
+                                طباعة الفاتورة
+                              </button>
+                              <button
+                                type="button"
+                                className="secondary small"
+                                disabled={!student}
+                                onClick={() => openHistoricalInvoice(student, payment.id, "whatsapp")}
+                              >
+                                إرسال عبر WhatsApp
+                              </button>
+                            </div>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </section>
         </>
       )}
 
@@ -2984,7 +3676,22 @@ function Payments() {
           }}
         />
       )}
-    </>
+      {historyInvoice && (
+        <PaymentInvoiceModal
+          student={historyInvoice.student}
+          initialMonth={selectedHistoryMonth}
+          initialPaymentId={historyInvoice.paymentId}
+          initialAction={historyInvoice.action}
+          whatsAppWindow={historyInvoice.whatsAppWindow}
+          close={() => {
+            setHistoryInvoice(null);
+            if (historyInvoice.whatsAppWindow && historyInvoice.action !== "whatsapp") {
+              historyInvoice.whatsAppWindow.close();
+            }
+          }}
+        />
+      )}
+    </div>
   );
 }
 
@@ -4049,8 +4756,10 @@ function Inner({ page }: { page: Section }) {
       <main className="main">
         <header className="topbar">
           <button
+            type="button"
             className="mobile-menu"
             onClick={() => setOpen(true)}
+            aria-label="فتح القائمة الرئيسية"
           >
             <Icon name="menu" />
           </button>
@@ -4064,25 +4773,29 @@ function Inner({ page }: { page: Section }) {
           <div className="actions">
             <div className="language-switcher">
               <button
+                type="button"
                 className={
                   lang === "ar" ? "selected" : ""
                 }
                 onClick={() => setLang("ar")}
+                aria-label="تبديل اللغة إلى العربية"
               >
                 العربية
               </button>
 
               <button
+                type="button"
                 className={
                   lang === "fr" ? "selected" : ""
                 }
                 onClick={() => setLang("fr")}
+                aria-label="Switch language to French"
               >
                 FR
               </button>
             </div>
 
-            <button className="notify">
+            <button type="button" className="notify" aria-label="الإشعارات">
               <Icon name="bell" />
               <i />
             </button>

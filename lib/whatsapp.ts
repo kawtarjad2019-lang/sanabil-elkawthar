@@ -35,6 +35,78 @@ export function normalizeWhatsAppNumber(rawNumber?: string | null) {
   return `+${withoutPlus}`;
 }
 
+export function normalizeMoroccanMobileNumber(rawNumber?: string | null) {
+  if (!rawNumber?.trim()) return null;
+
+  const number = rawNumber.trim().replace(/[\s().-]/g, "");
+  if (!/^\+?\d+$/.test(number)) return null;
+
+  let mobileNumber: string | null = null;
+
+  if (/^0[67]\d{8}$/.test(number)) {
+    mobileNumber = number.slice(1);
+  } else {
+    const internationalMatch = /^(?:\+212|00212|212)([67]\d{8})$/.exec(number);
+    mobileNumber = internationalMatch?.[1] ?? null;
+  }
+
+  return mobileNumber ? `+212${mobileNumber}` : null;
+}
+
+export function buildInvoiceWhatsAppMessage({
+  studentName,
+  month,
+  totalAmount,
+  paidAmount,
+  balance,
+  lang,
+}: {
+  studentName: string;
+  month: string;
+  totalAmount: number;
+  paidAmount: number;
+  balance: number;
+  lang: "ar" | "fr";
+}) {
+  const [year, monthNumber] = month.split("-").map(Number);
+  const monthLabel = new Date(Date.UTC(year, monthNumber - 1, 1)).toLocaleDateString(
+    lang === "ar" ? "ar-MA" : "fr-FR",
+    { month: "long", year: "numeric", timeZone: "UTC" }
+  );
+  const formatAmount = (amount: number) => `${amount.toLocaleString("fr-FR")} د.م`;
+
+  if (lang === "fr") {
+    return [
+      "Bonjour,",
+      `Voici la facture de paiement de ${studentName} pour ${monthLabel}.`,
+      "",
+      `Montant total : ${formatAmount(totalAmount)}`,
+      `Montant déjà payé : ${formatAmount(paidAmount)}`,
+      `Solde restant : ${formatAmount(balance)}`,
+      "",
+      "Merci d'avoir choisi Sanabil Elkawthar.",
+    ].join("\n");
+  }
+
+  return [
+    "السلام عليكم،",
+    `هذه فاتورة الأداء الخاصة بالتلميذ(ة) ${studentName} عن شهر ${monthLabel}.`,
+    "",
+    `المبلغ الإجمالي: ${formatAmount(totalAmount)}`,
+    `المبلغ المؤدى: ${formatAmount(paidAmount)}`,
+    `الرصيد المتبقي: ${formatAmount(balance)}`,
+    "",
+    "شكراً لاختياركم مركز سنابل الكوثر.",
+  ].join("\n");
+}
+
+export function buildWhatsAppWebUrl(rawNumber: string, message: string) {
+  const normalizedNumber = normalizeMoroccanMobileNumber(rawNumber);
+  if (!normalizedNumber || !message.trim()) return null;
+
+  return `https://web.whatsapp.com/send?phone=${normalizedNumber.slice(1)}&text=${encodeURIComponent(message)}`;
+}
+
 export function getMonthLabel(monthKey: string) {
   if (!monthKey) return "";
 
